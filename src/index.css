@@ -236,6 +236,10 @@ button {
   grid-template-columns: minmax(320px, 0.92fr) minmax(360px, 1.08fr);
 }
 
+.wide-panel {
+  grid-column: 1 / -1;
+}
+
 .data-layout {
   grid-template-columns: minmax(480px, 1fr) 380px;
   align-items: start;
@@ -658,6 +662,42 @@ button:disabled {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin-top: 18px;
+}
+
+.mining-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #28313b;
+  border-radius: 8px;
+  background: #0d1116;
+}
+
+.mining-status h2 {
+  margin: 0 0 5px;
+  font-size: 17px;
+  letter-spacing: 0;
+}
+
+.mining-status p {
+  margin: 0;
+  color: #87909d;
+  line-height: 1.5;
+}
+
+.log-panel {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid #28313b;
+  border-radius: 8px;
+  background: #0d1116;
+  color: #aeb8c5;
+  font-size: 12px;
 }
 
 .empty-state {

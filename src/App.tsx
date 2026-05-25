@@ -19,11 +19,14 @@ import {
   Loader2,
   Lock,
   Plus,
+  Play,
   RefreshCw,
   Search,
+  Server,
   Settings,
   Share2,
   ShieldCheck,
+  Square,
   Trash2,
   UploadCloud,
   Wallet,
@@ -35,10 +38,15 @@ import { downloadFile, uploadFile } from '@falari-extension/lib/storage';
 import {
   createPasscodeShare,
   downloadPrivateFile,
+  openAddressShare,
+  openPasscodeShare,
+  parseShareLink,
+  recoverOwnerDataKeyBase64,
+  sharePrivateFileWithAddress,
   uploadPrivateFile,
 } from '@falari-extension/lib/private-storage';
 
-type Section = 'dashboard' | 'wallets' | 'data' | 'upload' | 'shares' | 'settings';
+type Section = 'dashboard' | 'wallets' | 'data' | 'upload' | 'shares' | 'mining' | 'settings';
 type AssetAccess = 'public' | 'private';
 type AssetStatus = 'local' | 'uploading' | 'active' | 'shared' | 'deleted' | 'error';
 
@@ -74,6 +82,23 @@ interface DesktopState {
   selectedWalletId?: string;
   assets: DataAsset[];
   chainUrl: string;
+  mining: MiningConfig;
+}
+
+interface MiningConfig {
+  addr: string;
+  endpoint: string;
+  dataDir: string;
+  capacity: number;
+  stake: number;
+  p2pListen: string;
+  p2pPeers: string;
+}
+
+interface MiningRuntime {
+  running: boolean;
+  pid?: number | null;
+  logs: string[];
 }
 
 const STORAGE_KEY = 'falari_desktop_state_v1';
@@ -81,6 +106,15 @@ const defaultState: DesktopState = {
   wallets: [],
   assets: [],
   chainUrl: 'http://localhost:8080',
+  mining: {
+    addr: ':9090',
+    endpoint: 'http://localhost:9090',
+    dataDir: './data/desktop-miner',
+    capacity: 1024 ** 4,
+    stake: 1000,
+    p2pListen: '',
+    p2pPeers: '',
+  },
 };
 
 const durationOptions = [
@@ -96,8 +130,23 @@ const navigation = [
   { id: 'data', label: '数据', icon: Database },
   { id: 'upload', label: '上传', icon: UploadCloud },
   { id: 'shares', label: '分享', icon: Share2 },
+  { id: 'mining', label: '挖矿', icon: Server },
   { id: 'settings', label: '设置', icon: Settings },
 ] satisfies { id: Section; label: string; icon: typeof Gauge }[];
+
+declare global {
+  interface Window {
+    falariDesktop?: {
+      platform: string;
+      version: string;
+      miningStatus: () => Promise<MiningRuntime>;
+      startMining: (config: MiningConfig & { chainUrl: string }) => Promise<MiningRuntime>;
+      stopMining: () => Promise<MiningRuntime>;
+      onMiningLog: (callback: (line: string) => void) => () => void;
+      onMiningStatus: (callback: (status: MiningRuntime) => void) => () => void;
+    };
+  }
+}
 
 function loadState(): DesktopState {
   try {
@@ -173,6 +222,7 @@ export default function App() {
   const [query, setQuery] = useState('');
   const [selectedAssetId, setSelectedAssetId] = useState<string | undefined>();
   const [chainStatus, setChainStatus] = useState<any>(null);
+  const [miningRuntime, setMiningRuntime] = useState<MiningRuntime>({ running: false, logs: [] });
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState('');
   const [walletName, setWalletName] = useState('Main Wallet');
@@ -182,6 +232,9 @@ export default function App() {
   const [duration, setDuration] = useState(durationOptions[1].value);
   const [autoRenew, setAutoRenew] = useState(false);
   const [shareRecipient, setShareRecipient] = useState('');
+  const [shareFullLink, setShareFullLink] = useState(false);
+  const [openShareId, setOpenShareId] = useState('');
+  const [openAccessCode, setOpenAccessCode] = useState('');
   const [renewDuration, setRenewDuration] = useState(durationOptions[1].value);
   const [topUpAmount, setTopUpAmount] = useState(1000000);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -197,6 +250,23 @@ export default function App() {
   useEffect(() => {
     saveState(state);
   }, [state]);
+
+  useEffect(() => {
+    if (!window.falariDesktop) return;
+    let cancelled = false;
+    window.falariDesktop.miningStatus().then((status) => {
+      if (!cancelled) setMiningRuntime(status);
+    }).catch(() => {});
+    const offLog = window.falariDesktop.onMiningLog((line) => {
+      setMiningRuntime((current) => ({ ...current, logs: [...current.logs.slice(-79), line] }));
+    });
+    const offStatus = window.falariDesktop.onMiningStatus((status) => setMiningRuntime(status));
+    return () => {
+      cancelled = true;
+      offLog();
+      offStatus();
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -225,6 +295,44 @@ export default function App() {
       ...current,
       assets: current.assets.map((asset) => asset.id === assetId ? { ...asset, ...patch, updatedAt: Date.now() } : asset),
     }));
+  }
+
+  function updateMiningConfig(patch: Partial<MiningConfig>) {
+    setState((current) => ({
+      ...current,
+      mining: { ...current.mining, ...patch },
+    }));
+  }
+
+  async function startMining() {
+    if (!window.falariDesktop) {
+      setNotice('当前运行环境不支持启动本地挖矿节点。');
+      return;
+    }
+    setBusy('mining');
+    try {
+      const status = await window.falariDesktop.startMining({ ...state.mining, chainUrl: state.chainUrl });
+      setMiningRuntime(status);
+      setNotice('挖矿已开启，本地节点会同时提供上传和下载访问服务。');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '启动挖矿失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function stopMining() {
+    if (!window.falariDesktop) return;
+    setBusy('mining-stop');
+    try {
+      const status = await window.falariDesktop.stopMining();
+      setMiningRuntime(status);
+      setNotice('挖矿停止中，节点会停止提供访问服务。');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '停止挖矿失败');
+    } finally {
+      setBusy('');
+    }
   }
 
   async function createWallet() {
@@ -290,6 +398,8 @@ export default function App() {
       const result: any = uploadAccess === 'private'
         ? await uploadPrivateFile(api, selectedFile, selectedWallet.address, {
           duration,
+          ownerPrivateKey: selectedWallet.privateKey,
+          ownerAddress: selectedWallet.address,
           onProgress: (stage) => {
             updateAsset(assetId, { status: 'uploading' });
             setNotice(`上传进度：${stage}`);
@@ -330,6 +440,11 @@ export default function App() {
     try {
       const result = asset.access === 'private' && asset.dataKeyBase64
         ? await downloadPrivateFile(api, normalizeIntentId(asset), { dataKeyBase64: asset.dataKeyBase64 })
+        : asset.access === 'private' && selectedWallet
+          ? await downloadPrivateFile(api, normalizeIntentId(asset), {
+            owner: selectedWallet.address,
+            ownerPrivateKey: selectedWallet.privateKey,
+          })
         : await downloadFile(api, normalizeIntentId(asset), selectedWallet?.address || '');
       downloadBlob(result.fileName || asset.fileName, result.data);
       setNotice('下载已开始。');
@@ -347,11 +462,18 @@ export default function App() {
     }
     setBusy('share');
     try {
+      const dataKeyBase64 = selectedAsset.dataKeyBase64 || await recoverOwnerDataKeyBase64(
+        api,
+        selectedAsset.intentId,
+        selectedWallet.address,
+        selectedWallet.privateKey,
+      );
       const result = await createPasscodeShare(api, {
         intentId: selectedAsset.intentId,
         owner: selectedWallet.address,
-        dataKeyBase64: selectedAsset.dataKeyBase64,
+        dataKeyBase64,
         appBaseUrl: 'falari://open',
+        includeKeyInUrl: shareFullLink,
       });
       updateAsset(selectedAsset.id, {
         status: 'shared',
@@ -361,6 +483,58 @@ export default function App() {
       setNotice('访问码分享已生成。');
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '分享失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function handleAddressShare() {
+    if (!selectedAsset || !selectedWallet || !shareRecipient.trim()) {
+      setNotice('请选择文件并填写接收方地址。');
+      return;
+    }
+    setBusy('address-share');
+    try {
+      const result = await sharePrivateFileWithAddress(api, {
+        intentId: selectedAsset.intentId,
+        owner: selectedWallet.address,
+        ownerPrivateKey: selectedWallet.privateKey,
+        recipient: shareRecipient.trim(),
+        dataKeyBase64: selectedAsset.dataKeyBase64,
+        appBaseUrl: 'falari://open',
+        includeKeyInUrl: true,
+      });
+      updateAsset(selectedAsset.id, {
+        status: 'shared',
+        shareUrl: result.url,
+        accessCode: result.accessCode,
+      });
+      setNotice('地址分享链接已生成。');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '地址分享失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function handleOpenShare() {
+    if (!selectedWallet || !openShareId.trim()) return;
+    setBusy('open-share');
+    try {
+      const parsed = parseShareLink(openShareId);
+      const code = openAccessCode.trim() || parsed.accessCode || '';
+      if (!parsed.shareId) {
+        throw new Error('请输入分享 ID 或分享链接。');
+      }
+      if (!code) {
+        throw new Error('请输入访问码或分享链接里的密钥片段。');
+      }
+      const opened = await openShareWithCode(api, parsed.shareId, code, selectedWallet.address);
+      const result = await downloadPrivateFile(api, opened.intentId, { dataKeyBase64: opened.dataKeyBase64 });
+      downloadBlob(result.fileName, result.data);
+      setNotice('分享文件已解密下载。');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '打开分享失败');
     } finally {
       setBusy('');
     }
@@ -541,10 +715,30 @@ export default function App() {
             assets={state.assets}
             selectedAsset={selectedAsset}
             shareRecipient={shareRecipient}
+            shareFullLink={shareFullLink}
+            openShareId={openShareId}
+            openAccessCode={openAccessCode}
             busy={busy}
             onSelect={(asset) => setSelectedAssetId(asset.id)}
             onShareRecipient={setShareRecipient}
+            onShareFullLink={setShareFullLink}
             onPasscodeShare={handlePasscodeShare}
+            onAddressShare={handleAddressShare}
+            onOpenShareId={setOpenShareId}
+            onOpenAccessCode={setOpenAccessCode}
+            onOpenShare={handleOpenShare}
+          />
+        )}
+
+        {section === 'mining' && (
+          <MiningView
+            config={state.mining}
+            chainUrl={state.chainUrl}
+            runtime={miningRuntime}
+            busy={busy}
+            onConfig={updateMiningConfig}
+            onStart={startMining}
+            onStop={stopMining}
           />
         )}
 
@@ -557,6 +751,23 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+async function openShareWithCode(
+  api: ChainApi,
+  shareId: string,
+  code: string,
+  recipient: string,
+): Promise<{ intentId: string; dataKeyBase64: string }> {
+  try {
+    return await openPasscodeShare(api, shareId, code);
+  } catch {
+    return openAddressShare(api, {
+      shareId,
+      recipient,
+      shareSecret: code,
+    });
+  }
 }
 
 function Dashboard({ chainStatus, wallets, assets, onOpenUpload }: {
@@ -803,10 +1014,18 @@ function SharesView(props: {
   assets: DataAsset[];
   selectedAsset?: DataAsset;
   shareRecipient: string;
+  shareFullLink: boolean;
+  openShareId: string;
+  openAccessCode: string;
   busy: string;
   onSelect: (asset: DataAsset) => void;
   onShareRecipient: (recipient: string) => void;
+  onShareFullLink: (value: boolean) => void;
   onPasscodeShare: () => void;
+  onAddressShare: () => void;
+  onOpenShareId: (value: string) => void;
+  onOpenAccessCode: (value: string) => void;
+  onOpenShare: () => void;
 }) {
   const privateAssets = props.assets.filter((asset) => asset.access === 'private');
   return (
@@ -827,14 +1046,22 @@ function SharesView(props: {
             {props.busy === 'share' ? <Loader2 className="spin" size={17} /> : <Share2 size={17} />}
             生成
           </button>
+          <label className="check-row">
+            <input type="checkbox" checked={props.shareFullLink} onChange={(event) => props.onShareFullLink(event.target.checked)} />
+            生成一个完整链接
+          </label>
         </div>
         <div className="share-card muted-card">
           <KeyRound size={22} />
           <div>
             <h3>地址分享</h3>
-            <p>后续接入接收方 Vault Public Key 后，可自动为地址生成 Key Envelope。</p>
+            <p>输入合法 0x 地址即可，不查询地址是否存在。密钥片段只放在分享链接里，不写入链上。</p>
           </div>
           <input value={props.shareRecipient} onChange={(event) => props.onShareRecipient(event.target.value)} placeholder="0x recipient" />
+          <button className="secondary-button" onClick={props.onAddressShare} disabled={!props.selectedAsset || !props.shareRecipient.trim() || props.busy === 'address-share'}>
+            {props.busy === 'address-share' ? <Loader2 className="spin" size={17} /> : <KeyRound size={17} />}
+            分享给地址
+          </button>
         </div>
         {props.selectedAsset?.shareUrl && (
           <div className="share-result">
@@ -844,7 +1071,105 @@ function SharesView(props: {
             <div className="mono">{props.selectedAsset.accessCode}</div>
           </div>
         )}
+        <div className="share-card muted-card">
+          <Download size={22} />
+          <div>
+            <h3>打开分享</h3>
+            <p>输入分享 ID 和访问码；地址分享使用链接里的密钥片段。</p>
+          </div>
+          <input value={props.openShareId} onChange={(event) => props.onOpenShareId(event.target.value)} placeholder="share_xxx 或完整分享链接" />
+          <input value={props.openAccessCode} onChange={(event) => props.onOpenAccessCode(event.target.value)} placeholder="访问码或链接密钥" />
+          <button className="primary-button" onClick={props.onOpenShare} disabled={!props.openShareId.trim() || props.busy === 'open-share'}>
+            {props.busy === 'open-share' ? <Loader2 className="spin" size={17} /> : <Download size={17} />}
+            打开并下载
+          </button>
+        </div>
       </aside>
+    </div>
+  );
+}
+
+function MiningView(props: {
+  config: MiningConfig;
+  chainUrl: string;
+  runtime: MiningRuntime;
+  busy: string;
+  onConfig: (patch: Partial<MiningConfig>) => void;
+  onStart: () => void;
+  onStop: () => void;
+}) {
+  const canControl = Boolean(window.falariDesktop);
+  return (
+    <div className="two-column">
+      <section className="surface">
+        <div className="section-title">本机挖矿节点</div>
+        <div className="mining-status">
+          <div className={`node-dot ${props.runtime.running ? 'online' : ''}`} />
+          <div>
+            <h2>{props.runtime.running ? '挖矿运行中' : '挖矿未开启'}</h2>
+            <p>开启后，本机客户端会注册为存储矿工，并强制提供 shard 上传和下载访问服务。</p>
+          </div>
+        </div>
+        <div className="detail-grid">
+          <Detail label="链节点" value={props.chainUrl} />
+          <Detail label="访问入口" value={props.config.endpoint} />
+          <Detail label="监听端口" value={props.config.addr} />
+          <Detail label="进程" value={props.runtime.pid ? String(props.runtime.pid) : '-'} />
+        </div>
+        <div className="action-stack">
+          <button className="primary-button" onClick={props.onStart} disabled={!canControl || props.runtime.running || props.busy === 'mining'}>
+            {props.busy === 'mining' ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
+            开启挖矿
+          </button>
+          <button className="secondary-button" onClick={props.onStop} disabled={!canControl || !props.runtime.running || props.busy === 'mining-stop'}>
+            {props.busy === 'mining-stop' ? <Loader2 className="spin" size={17} /> : <Square size={17} />}
+            停止
+          </button>
+        </div>
+      </section>
+
+      <section className="surface">
+        <div className="section-title">节点配置</div>
+        <div className="form-grid">
+          <label>
+            监听地址
+            <input value={props.config.addr} onChange={(event) => props.onConfig({ addr: event.target.value })} />
+          </label>
+          <label>
+            公开访问地址
+            <input value={props.config.endpoint} onChange={(event) => props.onConfig({ endpoint: event.target.value })} />
+          </label>
+          <label>
+            数据目录
+            <input value={props.config.dataDir} onChange={(event) => props.onConfig({ dataDir: event.target.value })} />
+          </label>
+          <label>
+            质押数量
+            <input type="number" value={props.config.stake} onChange={(event) => props.onConfig({ stake: Number(event.target.value) })} />
+          </label>
+          <label>
+            容量字节
+            <input type="number" value={props.config.capacity} onChange={(event) => props.onConfig({ capacity: Number(event.target.value) })} />
+          </label>
+          <label>
+            P2P 监听
+            <input value={props.config.p2pListen} onChange={(event) => props.onConfig({ p2pListen: event.target.value })} placeholder="/ip4/0.0.0.0/tcp/0" />
+          </label>
+          <label className="wide">
+            P2P peers
+            <input value={props.config.p2pPeers} onChange={(event) => props.onConfig({ p2pPeers: event.target.value })} placeholder="多个地址用英文逗号分隔" />
+          </label>
+        </div>
+      </section>
+
+      <section className="surface wide-panel">
+        <div className="section-title">运行日志</div>
+        <div className="log-panel">
+          {props.runtime.logs.length > 0
+            ? props.runtime.logs.map((line, index) => <div key={`${index}-${line}`} className="mono">{line}</div>)
+            : <EmptyState title="暂无日志" body="启动本地挖矿后会显示注册、证明、上传和下载服务日志。" />}
+        </div>
+      </section>
     </div>
   );
 }
