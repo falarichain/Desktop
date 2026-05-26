@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, safeStorage } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
@@ -80,6 +80,18 @@ ipcMain.handle('mining:stop', () => {
     miningProcess.kill('SIGTERM');
   }
   return miningStatus();
+});
+
+ipcMain.handle('safeStorage:available', () => safeStorage.isEncryptionAvailable());
+
+ipcMain.handle('safeStorage:encrypt', (_event, plaintext) => {
+  if (!safeStorage.isEncryptionAvailable()) return null;
+  return safeStorage.encryptString(plaintext).toString('base64');
+});
+
+ipcMain.handle('safeStorage:decrypt', (_event, base64Encrypted) => {
+  if (!safeStorage.isEncryptionAvailable()) return null;
+  return safeStorage.decryptString(Buffer.from(base64Encrypted, 'base64'));
 });
 
 function createWindow() {

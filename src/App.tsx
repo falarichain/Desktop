@@ -29,11 +29,23 @@ import {
   Square,
   Trash2,
   UploadCloud,
+  Users,
   Wallet,
   X,
 } from 'lucide-react';
 import { ethers } from 'ethers';
 import { ChainApi } from '@falari-extension/lib/api';
+import {
+  computeMultisigAddress,
+  validateMultisigSigners,
+  buildMultisigTransferRequest,
+  signMultisigCreate,
+  signMultisigExec,
+  encodeMultisigProposal,
+  decodeMultisigProposal,
+  sortSignatures,
+} from '@falari-extension/lib/multisig';
+import type { MultisigWallet, MultisigWalletInfo, MultisigProposal, MultisigExecRequest } from '@falari-extension/lib/types';
 import { downloadFile, uploadFile } from '@falari-extension/lib/storage';
 import {
   createPasscodeShare,
@@ -46,7 +58,7 @@ import {
   uploadPrivateFile,
 } from '@falari-extension/lib/private-storage';
 
-type Section = 'dashboard' | 'wallets' | 'data' | 'upload' | 'shares' | 'mining' | 'settings';
+type Section = 'dashboard' | 'wallets' | 'multisig' | 'data' | 'upload' | 'shares' | 'mining' | 'settings';
 type AssetAccess = 'public' | 'private';
 type AssetStatus = 'local' | 'uploading' | 'active' | 'shared' | 'deleted' | 'error';
 
@@ -127,6 +139,7 @@ const durationOptions = [
 const navigation = [
   { id: 'dashboard', label: '概览', icon: Gauge },
   { id: 'wallets', label: '钱包', icon: Wallet },
+  { id: 'multisig', label: '多签', icon: Users },
   { id: 'data', label: '数据', icon: Database },
   { id: 'upload', label: '上传', icon: UploadCloud },
   { id: 'shares', label: '分享', icon: Share2 },
@@ -142,10 +155,37 @@ declare global {
       miningStatus: () => Promise<MiningRuntime>;
       startMining: (config: MiningConfig & { chainUrl: string }) => Promise<MiningRuntime>;
       stopMining: () => Promise<MiningRuntime>;
+      safeStorageAvailable: () => Promise<boolean>;
+      encryptSecret: (plaintext: string) => Promise<string | null>;
+      decryptSecret: (base64: string) => Promise<string | null>;
       onMiningLog: (callback: (line: string) => void) => () => void;
       onMiningStatus: (callback: (status: MiningRuntime) => void) => () => void;
     };
   }
+}
+
+const SAFE_PREFIX = 'safe:';
+
+async function encryptWalletKeys(wallets: WalletRecord[]): Promise<WalletRecord[]> {
+  if (!window.falariDesktop) return wallets;
+  const available = await window.falariDesktop.safeStorageAvailable();
+  if (!available) return wallets;
+  return Promise.all(wallets.map(async (w) => {
+    if (!w.privateKey || w.privateKey.startsWith(SAFE_PREFIX)) return w;
+    const encrypted = await window.falariDesktop!.encryptSecret(w.privateKey);
+    return encrypted ? { ...w, privateKey: SAFE_PREFIX + encrypted } : w;
+  }));
+}
+
+async function decryptWalletKeys(wallets: WalletRecord[]): Promise<WalletRecord[]> {
+  if (!window.falariDesktop) return wallets;
+  const available = await window.falariDesktop.safeStorageAvailable();
+  if (!available) return wallets;
+  return Promise.all(wallets.map(async (w) => {
+    if (!w.privateKey.startsWith(SAFE_PREFIX)) return w;
+    const decrypted = await window.falariDesktop!.decryptSecret(w.privateKey.slice(SAFE_PREFIX.length));
+    return decrypted ? { ...w, privateKey: decrypted } : w;
+  }));
 }
 
 function loadState(): DesktopState {
@@ -157,8 +197,10 @@ function loadState(): DesktopState {
   }
 }
 
-function saveState(state: DesktopState) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+async function saveState(state: DesktopState) {
+  const encryptedWallets = await encryptWalletKeys(state.wallets);
+  const toStore = { ...state, wallets: encryptedWallets };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
 }
 
 function formatSize(bytes: number) {
@@ -250,6 +292,16 @@ export default function App() {
   useEffect(() => {
     saveState(state);
   }, [state]);
+
+  useEffect(() => {
+    let cancelled = false;
+    decryptWalletKeys(state.wallets).then((decrypted) => {
+      if (!cancelled && decrypted.some((w, i) => w.privateKey !== state.wallets[i]?.privateKey)) {
+        setState((s) => ({ ...s, wallets: decrypted }));
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!window.falariDesktop) return;
@@ -676,6 +728,10 @@ export default function App() {
           />
         )}
 
+        {section === 'multisig' && (
+          <MultisigView api={api} wallets={state.wallets} />
+        )}
+
         {section === 'data' && (
           <DataView
             assets={filteredAssets}
@@ -870,6 +926,393 @@ function WalletsView(props: {
           领取本地测试币
         </button>
       </section>
+    </div>
+  );
+}
+
+function MultisigView({ api, wallets }: { api: ChainApi; wallets: WalletRecord[] }) {
+  const [msWallets, setMsWallets] = useState<MultisigWalletInfo[]>([]);
+  const [proposals, setProposals] = useState<MultisigProposal[]>([]);
+  const [signerInputs, setSignerInputs] = useState<string[]>(['', '']);
+  const [threshold, setThreshold] = useState(2);
+  const [createError, setCreateError] = useState('');
+  const [previewAddr, setPreviewAddr] = useState<string | null>(null);
+  const [selWallet, setSelWallet] = useState('');
+  const [transferTo, setTransferTo] = useState('');
+  const [transferAmount, setTransferAmount] = useState('');
+  const [transferFee, setTransferFee] = useState('1');
+  const [transferErr, setTransferErr] = useState('');
+  const [shareStr, setShareStr] = useState('');
+  const [importStr, setImportStr] = useState('');
+  const [importErr, setImportErr] = useState('');
+  const [signPropId, setSignPropId] = useState<string | null>(null);
+  const [signAddr, setSignAddr] = useState('');
+  const [signErr, setSignErr] = useState('');
+  const [copied, setCopied] = useState('');
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+
+  const salt = useMemo(() => Math.floor(Math.random() * 1_000_000), []);
+
+  // Local address set for quick lookups
+  const localAddrs = useMemo(() => new Set(wallets.map((w) => w.address.toLowerCase())), [wallets]);
+  const addrLabel = (addr: string) => wallets.find((w) => w.address.toLowerCase() === addr.toLowerCase())?.name;
+  const validSignerCount = signerInputs.filter((s) => s.trim().length > 0).length;
+
+  useEffect(() => {
+    api.listMultisigWallets().then((r) => setMsWallets(r.wallets || [])).catch(() => {});
+  }, [api]);
+
+  useEffect(() => {
+    const validAddrs = signerInputs.filter((s) => s.trim().length > 0);
+    if (validAddrs.length >= 2 && !validateMultisigSigners(validAddrs)) {
+      try { setPreviewAddr(computeMultisigAddress(validAddrs, threshold, salt)); } catch { setPreviewAddr(null); }
+    } else { setPreviewAddr(null); }
+  }, [signerInputs, threshold, salt]);
+
+  const handleCopy = async (text: string) => {
+    try { await navigator.clipboard.writeText(text); } catch {
+      const ta = document.createElement('textarea'); ta.value = text;
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    setCopied(text); setTimeout(() => setCopied(''), 2000);
+  };
+
+  const handleCreate = async () => {
+    setCreateError('');
+    const signers = signerInputs.map((s) => s.trim()).filter(Boolean);
+    const err = validateMultisigSigners(signers);
+    if (err) { setCreateError(err); return; }
+    if (threshold > signers.length) { setCreateError('阈值不能超过签名者总数'); return; }
+    if (threshold < 1) { setCreateError('阈值至少为 1'); return; }
+    try {
+      let creatorPk = '';
+      for (const s of signers) {
+        const w = wallets.find((wr) => wr.address.toLowerCase() === s.toLowerCase());
+        if (w?.privateKey) { creatorPk = w.privateKey; break; }
+      }
+      if (!creatorPk) { setCreateError('至少需要一个本地签名者来签署创建请求'); return; }
+      const signature = await signMultisigCreate(signers, threshold, salt, creatorPk);
+      const result = await api.createMultisigWallet({ signers, threshold, salt, signature });
+      setMsWallets((prev) => [...prev, { wallet: result, balance: 0 }]);
+      setSignerInputs(['', '']); setThreshold(2); setPreviewAddr(null);
+    } catch (err: any) { setCreateError(err.message || '创建失败'); }
+  };
+
+  const handleRemoveWallet = (address: string) => {
+    setMsWallets((prev) => prev.filter((w) => w.wallet.address !== address));
+    setProposals((prev) => prev.filter((p) => p.wallet !== address));
+    setConfirmRemove(null);
+  };
+
+  const handleCreateProposal = async () => {
+    setTransferErr('');
+    if (!selWallet) { setTransferErr('请先选择多签钱包'); return; }
+    const wInfo = msWallets.find((w) => w.wallet.address === selWallet);
+    if (!wInfo) { setTransferErr('找不到该钱包'); return; }
+    const amount = parseFloat(transferAmount);
+    if (isNaN(amount) || amount <= 0) { setTransferErr('请输入有效金额'); return; }
+    if (!transferTo.trim()) { setTransferErr('请输入收款地址'); return; }
+    const fee = parseFloat(transferFee) || 1;
+
+    let signerAddr = '', signerPk = '';
+    for (const s of wInfo.wallet.signers) {
+      const w = wallets.find((wr) => wr.address.toLowerCase() === s.toLowerCase());
+      if (w?.privateKey) { signerAddr = w.address; signerPk = w.privateKey; break; }
+    }
+    if (!signerPk) { setTransferErr('该钱包没有可用的本地签名者'); return; }
+
+    try {
+      const req = buildMultisigTransferRequest(selWallet, transferTo.trim(), amount, wInfo.wallet.nonce, fee);
+      const sig = await signMultisigExec(req, signerAddr, signerPk);
+      req.signatures = [sig];
+      const prop: MultisigProposal = {
+        id: `msig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        wallet: req.wallet, operation: req.operation, payload: req.payload,
+        nonce: req.nonce, fee: req.fee, signatures: req.signatures,
+        status: 'pending', createdAt: Date.now(),
+      };
+      setProposals((p) => [...p, prop]);
+      setShareStr(encodeMultisigProposal(req));
+      setTransferTo(''); setTransferAmount('');
+    } catch (err: any) { setTransferErr(err.message || '创建提案失败'); }
+  };
+
+  const handleImportProposal = () => {
+    setImportErr('');
+    const req = decodeMultisigProposal(importStr.trim());
+    if (!req) { setImportErr('无效的提案字符串'); return; }
+    if (!msWallets.find((w) => w.wallet.address === req.wallet)) { setImportErr('对应的多签钱包不存在，请先创建或导入'); return; }
+    const prop: MultisigProposal = {
+      id: `msig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      wallet: req.wallet, operation: req.operation, payload: req.payload,
+      nonce: req.nonce, fee: req.fee, signatures: req.signatures || [],
+      status: 'pending', createdAt: Date.now(),
+    };
+    setProposals((p) => [...p, prop]);
+    setImportStr('');
+  };
+
+  const handleSignProposal = async (propId: string) => {
+    setSignErr('');
+    const prop = proposals.find((p) => p.id === propId);
+    if (!prop || !signAddr) { setSignErr('请选择签名者'); return; }
+    const w = wallets.find((wr) => wr.address.toLowerCase() === signAddr.toLowerCase());
+    if (!w?.privateKey) { setSignErr('该地址的私钥不可用'); return; }
+    const wInfo = msWallets.find((mw) => mw.wallet.address === prop.wallet);
+    if (!wInfo?.wallet.signers.some((s) => s.toLowerCase() === signAddr.toLowerCase())) { setSignErr('该地址不是此钱包的签名者'); return; }
+    if (prop.signatures.some((s) => s.signer.toLowerCase() === signAddr.toLowerCase())) { setSignErr('该签名者已签署'); return; }
+    try {
+      const execReq: MultisigExecRequest = { wallet: prop.wallet, operation: prop.operation, payload: prop.payload, nonce: prop.nonce, fee: prop.fee, signatures: [] };
+      const sig = await signMultisigExec(execReq, signAddr, w.privateKey);
+      setProposals((prev) => prev.map((p) => p.id === propId ? { ...p, signatures: [...p.signatures.filter((s) => s.signer !== sig.signer), sig] } : p));
+      setSignPropId(null); setSignAddr('');
+    } catch (err: any) { setSignErr(err.message || '签名失败'); }
+  };
+
+  const handleSubmitProposal = async (propId: string) => {
+    const prop = proposals.find((p) => p.id === propId);
+    if (!prop) return;
+    const wInfo = msWallets.find((w) => w.wallet.address === prop.wallet);
+    if (!wInfo || prop.signatures.length < wInfo.wallet.threshold) return;
+    try {
+      await api.multisigExec({ wallet: prop.wallet, operation: prop.operation, payload: prop.payload, nonce: prop.nonce, fee: prop.fee, signatures: sortSignatures(prop.signatures) });
+      setProposals((prev) => prev.map((p) => p.id === propId ? { ...p, status: 'executed' } : p));
+      api.listMultisigWallets().then((r) => setMsWallets(r.wallets || [])).catch(() => {});
+    } catch (err: any) { console.error('Exec failed:', err); }
+  };
+
+  const pendingProps = proposals.filter((p) => p.status === 'pending');
+
+  return (
+    <div className="two-column">
+      <section className="surface">
+        <div className="section-title">创建多签钱包</div>
+        <p className="muted" style={{ fontSize: 12, margin: '-4px 0 12px', lineHeight: 1.5 }}>
+          添加 2~16 个签名者地址。转账需要至少 M 个签名者共同授权。默认要求全部签名者同意（M=N），你可以手动调低阈值。
+        </p>
+        <div className="form-grid">
+          {signerInputs.map((val, i) => {
+            const isLocal = val.trim() ? localAddrs.has(val.trim().toLowerCase()) : false;
+            const label = val.trim() ? addrLabel(val.trim()) : null;
+            return (
+              <label key={i}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  签名者 #{i + 1}
+                  {isLocal && <span style={{ fontSize: 9, color: 'var(--accent)', fontWeight: 600 }}>本地 · {label || '账户'}</span>}
+                </span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input
+                    value={val}
+                    onChange={(e) => { const n = [...signerInputs]; n[i] = e.target.value; setSignerInputs(n); setCreateError(''); }}
+                    placeholder="0x...  或从下方选择"
+                    style={isLocal ? { borderColor: 'var(--accent)', borderWidth: 1 } : {}}
+                  />
+                  {signerInputs.length > 2 && <button className="secondary-button" onClick={() => { const next = signerInputs.filter((_, j) => j !== i); setSignerInputs(next); if (threshold > next.filter(Boolean).length) setThreshold(next.filter(Boolean).length || 1); }}><Trash2 size={14} /></button>}
+                </div>
+                {wallets.length > 0 && (
+                  <select
+                    style={{ marginTop: 4, fontSize: 11, opacity: 0.7 }}
+                    value=""
+                    onChange={(e) => { if (e.target.value) { const n = [...signerInputs]; n[i] = e.target.value; setSignerInputs(n); setCreateError(''); } }}
+                  >
+                    <option value="">从本地钱包选择...</option>
+                    {wallets.map((w) => <option key={w.address} value={w.address}>{w.name} ({w.address.slice(0, 8)}...{w.address.slice(-4)})</option>)}
+                  </select>
+                )}
+              </label>
+            );
+          })}
+          <button className="secondary-button" onClick={() => { const next = [...signerInputs, '']; setSignerInputs(next); setThreshold(next.filter(Boolean).length || threshold); }}><Plus size={14} /> 添加签名者</button>
+          <label>
+            签名阈值：{validSignerCount > 0 ? `${threshold} / ${validSignerCount} 签名者需同意` : '—'}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input type="number" min={1} max={validSignerCount || 16} value={threshold} onChange={(e) => setThreshold(Math.max(1, Math.min(parseInt(e.target.value) || 1, validSignerCount || 16)))} style={{ width: 70 }} />
+              <button
+                className="secondary-button"
+                style={{ fontSize: 11, padding: '4px 10px', ...(threshold === validSignerCount ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : {}) }}
+                onClick={() => setThreshold(validSignerCount || 1)}
+              >全部 (N={validSignerCount})</button>
+              <button
+                className="secondary-button"
+                style={{ fontSize: 11, padding: '4px 10px', ...(threshold === Math.ceil(validSignerCount / 2) ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : {}) }}
+                onClick={() => setThreshold(Math.ceil(validSignerCount / 2) || 1)}
+              >多数 ({Math.ceil(validSignerCount / 2)}/{validSignerCount})</button>
+            </div>
+          </label>
+          {previewAddr && <div className="wide muted mono" style={{ fontSize: 12 }}>预览地址: {previewAddr}</div>}
+          {createError && <div className="wide" style={{ color: 'var(--danger)' }}>{createError}</div>}
+          <button className="primary-button" onClick={handleCreate}><Plus size={17} /> 创建多签钱包</button>
+        </div>
+      </section>
+
+      <section className="surface">
+        <div className="section-title">多签钱包列表</div>
+        <div className="wallet-list">
+          {msWallets.map((w) => {
+            const localCount = w.wallet.signers.filter((s) => localAddrs.has(s.toLowerCase())).length;
+            const allLocal = localCount === w.wallet.signers.length;
+            return (
+              <div key={w.wallet.address} className="wallet-row" style={{ cursor: 'default', flexDirection: 'column', alignItems: 'stretch' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div className="wallet-avatar"><Users size={18} /></div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span>{w.wallet.threshold}/{w.wallet.signers.length} 多签</span>
+                      {allLocal && <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 4, background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)', fontWeight: 600 }}>全部本地</span>}
+                      {!allLocal && localCount > 0 && <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 4, background: 'color-mix(in srgb, var(--accent) 10%, transparent)', color: 'var(--accent)', fontWeight: 600 }}>{localCount} 本地</span>}
+                    </div>
+                    <div className="mono muted" style={{ fontSize: 11 }}>{w.wallet.address}</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <button className="secondary-button" onClick={() => handleCopy(w.wallet.address)} style={{ padding: 4 }}>
+                      {copied === w.wallet.address ? '✓' : '复制'}
+                    </button>
+                    {confirmRemove === w.wallet.address ? (
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button className="primary-button" onClick={() => handleRemoveWallet(w.wallet.address)} style={{ padding: '4px 8px', fontSize: 11 }}>确认</button>
+                        <button className="secondary-button" onClick={() => setConfirmRemove(null)} style={{ padding: '4px 8px', fontSize: 11 }}>取消</button>
+                      </div>
+                    ) : (
+                      <button className="secondary-button" onClick={() => setConfirmRemove(w.wallet.address)} style={{ padding: 4, color: 'var(--danger)' }}><Trash2 size={14} /></button>
+                    )}
+                  </div>
+                </div>
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                  <div className="muted" style={{ fontSize: 10, marginBottom: 4 }}>签名者（需 {w.wallet.threshold} 人同意）</div>
+                  {w.wallet.signers.map((s) => {
+                    const local = localAddrs.has(s.toLowerCase());
+                    const lbl = addrLabel(s);
+                    return (
+                      <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                        <span style={{ width: 6, height: 6, borderRadius: '50%', background: local ? 'var(--accent)' : 'var(--border)', flexShrink: 0 }} />
+                        <code className="mono muted" style={{ fontSize: 10, flex: 1 }}>{s.slice(0, 10)}...{s.slice(-6)}</code>
+                        {local && <span style={{ fontSize: 9, color: 'var(--accent)', fontWeight: 500 }}>{lbl || '本地'}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+          {msWallets.length === 0 && <EmptyState title="还没有多签钱包" body="多签钱包需要多个签名者共同授权才能转账，适合团队共管资金。在上方创建一个多签钱包来开始。" />}
+        </div>
+      </section>
+
+      <section className="surface">
+        <div className="section-title">创建转账提案</div>
+        <p className="muted" style={{ fontSize: 12, margin: '-4px 0 12px', lineHeight: 1.5 }}>
+          创建一笔多签转账提案，自动用本地签名者签名后生成分享字符串。
+        </p>
+        <div className="form-grid">
+          <label>
+            多签钱包
+            <select value={selWallet} onChange={(e) => setSelWallet(e.target.value)}>
+              <option value="">选择钱包...</option>
+              {msWallets.map((w) => <option key={w.wallet.address} value={w.wallet.address}>{w.wallet.threshold}/{w.wallet.signers.length} ({w.wallet.address.slice(0, 10)}...)</option>)}
+            </select>
+          </label>
+          <label>
+            收款地址
+            <input value={transferTo} onChange={(e) => { setTransferTo(e.target.value); setTransferErr(''); }} placeholder="0x..." />
+          </label>
+          <label>
+            金额 (FAI)
+            <input type="number" step="any" min="0" value={transferAmount} onChange={(e) => { setTransferAmount(e.target.value); setTransferErr(''); }} placeholder="0.00" />
+          </label>
+          <label>
+            手续费
+            <input type="number" step="any" min="0" value={transferFee} onChange={(e) => setTransferFee(e.target.value)} />
+          </label>
+          {transferErr && <div className="wide" style={{ color: 'var(--danger)' }}>{transferErr}</div>}
+          <button className="primary-button" onClick={handleCreateProposal}><Plus size={17} /> 创建并签名</button>
+          {shareStr && (
+            <div className="wide">
+              <div style={{ color: 'var(--success)', marginBottom: 4, fontSize: 12 }}>提案已创建！分享以下字符串给其他签名者：</div>
+              <div className="mono" style={{ fontSize: 10, wordBreak: 'break-all', background: 'var(--surface-2)', padding: 8, borderRadius: 6 }}>{shareStr}</div>
+              <button className="secondary-button" style={{ marginTop: 6 }} onClick={() => handleCopy(shareStr)}>{copied === shareStr ? '已复制!' : '复制'}</button>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="surface">
+        <div className="section-title">导入提案</div>
+        <p className="muted" style={{ fontSize: 12, margin: '-4px 0 12px', lineHeight: 1.5 }}>
+          粘贴其他签名者分享的 fms_ 开头的提案字符串。
+        </p>
+        <div className="form-grid">
+          <label className="wide">
+            提案字符串
+            <textarea value={importStr} onChange={(e) => { setImportStr(e.target.value); setImportErr(''); }} placeholder="fms_..." rows={3} />
+          </label>
+          {importErr && <div className="wide" style={{ color: 'var(--danger)' }}>{importErr}</div>}
+          <button className="secondary-button" onClick={handleImportProposal}>导入</button>
+        </div>
+      </section>
+
+      {pendingProps.length > 0 && (
+        <section className="surface">
+          <div className="section-title">待处理提案 ({pendingProps.length})</div>
+          {pendingProps.map((p) => {
+            const wInfo = msWallets.find((w) => w.wallet.address === p.wallet);
+            const needed = wInfo ? wInfo.wallet.threshold : 0;
+            const got = p.signatures.length;
+            const thresholdMet = got >= needed;
+            const payload = p.payload as { to?: string; amount?: number };
+            return (
+              <div key={p.id} style={{ padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <div>
+                    <strong>{p.operation === 'transfer' ? '转账' : p.operation}</strong> — {wInfo ? `${wInfo.wallet.threshold}/${wInfo.wallet.signers.length}` : '...'}
+                    <div className="mono muted" style={{ fontSize: 11 }}>
+                      {payload.to && `至: ${payload.to.slice(0, 10)}...`} {payload.amount !== undefined && `| ${payload.amount} FAI`}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <span style={{ color: thresholdMet ? 'var(--success)' : 'var(--warning)', fontWeight: 600, fontSize: 12 }}>
+                      {got}/{needed}
+                    </span>
+                    <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{thresholdMet ? '可执行' : `还需 ${needed - got} 个签名`}</div>
+                  </div>
+                </div>
+                {got > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+                    {p.signatures.map((sig) => {
+                      const local = localAddrs.has(sig.signer.toLowerCase());
+                      return (
+                        <span key={sig.signer} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 6px', borderRadius: 4, background: 'var(--surface-2)', fontSize: 10 }}>
+                          <span style={{ color: 'var(--success)' }}>✓</span>
+                          <code className="mono muted" style={{ fontSize: 9 }}>{sig.signer.slice(0, 8)}...{sig.signer.slice(-4)}</code>
+                          {local && <span style={{ color: 'var(--accent)', fontSize: 8 }}>本地</span>}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {signPropId === p.id ? (
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
+                      <select value={signAddr} onChange={(e) => { setSignAddr(e.target.value); setSignErr(''); }} style={{ flex: 1 }}>
+                        <option value="">选择签名者...</option>
+                        {wallets.map((w) => <option key={w.address} value={w.address}>{w.name} ({w.address.slice(0, 8)}...)</option>)}
+                      </select>
+                      <button className="primary-button" onClick={() => handleSignProposal(p.id)}>签名</button>
+                      <button className="secondary-button" onClick={() => { setSignPropId(null); setSignAddr(''); setSignErr(''); }}>取消</button>
+                    </div>
+                  ) : (
+                    <>
+                      <button className="secondary-button" onClick={() => { setSignPropId(p.id); setSignErr(''); setSignAddr(''); }}>签名</button>
+                      <button className="secondary-button" onClick={() => handleCopy(encodeMultisigProposal({ wallet: p.wallet, operation: p.operation, payload: p.payload, nonce: p.nonce, fee: p.fee, signatures: p.signatures }))}>{copied === encodeMultisigProposal({ wallet: p.wallet, operation: p.operation, payload: p.payload, nonce: p.nonce, fee: p.fee, signatures: p.signatures }) ? '已复制' : '复制分享'}</button>
+                      {thresholdMet && <button className="primary-button" onClick={() => handleSubmitProposal(p.id)}>提交执行</button>}
+                    </>
+                  )}
+                </div>
+                {signPropId === p.id && signErr && <div style={{ color: 'var(--danger)', fontSize: 11, marginTop: 4 }}>{signErr}</div>}
+              </div>
+            );
+          })}
+        </section>
+      )}
     </div>
   );
 }
