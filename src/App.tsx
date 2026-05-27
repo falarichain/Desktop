@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
+  AlertTriangle,
   ArrowDownToLine,
+  ArrowRight,
   CalendarClock,
   CheckCircle2,
   ChevronRight,
   CircleDollarSign,
+  Clock,
   Cloud,
   Database,
   Download,
@@ -45,7 +48,8 @@ import {
   decodeMultisigProposal,
   sortSignatures,
 } from '@falari-extension/lib/multisig';
-import type { MultisigWallet, MultisigWalletInfo, MultisigProposal, MultisigExecRequest } from '@falari-extension/lib/types';
+import type { MultisigWallet, MultisigWalletInfo, MultisigProposal, MultisigExecRequest, BridgeConfig, BridgeOutbound } from '@falari-extension/lib/types';
+import { TOKEN_UNIT } from '@falari-extension/lib/types';
 import { downloadFile, uploadFile } from '@falari-extension/lib/storage';
 import {
   createPasscodeShare,
@@ -58,7 +62,7 @@ import {
   uploadPrivateFile,
 } from '@falari-extension/lib/private-storage';
 
-type Section = 'dashboard' | 'wallets' | 'multisig' | 'data' | 'upload' | 'shares' | 'mining' | 'settings';
+type Section = 'dashboard' | 'wallets' | 'multisig' | 'bridge' | 'data' | 'upload' | 'shares' | 'mining' | 'settings';
 type AssetAccess = 'public' | 'private';
 type AssetStatus = 'local' | 'uploading' | 'active' | 'shared' | 'deleted' | 'error';
 
@@ -140,6 +144,7 @@ const navigation = [
   { id: 'dashboard', label: '概览', icon: Gauge },
   { id: 'wallets', label: '钱包', icon: Wallet },
   { id: 'multisig', label: '多签', icon: Users },
+  { id: 'bridge', label: '跨链桥', icon: Link2 },
   { id: 'data', label: '数据', icon: Database },
   { id: 'upload', label: '上传', icon: UploadCloud },
   { id: 'shares', label: '分享', icon: Share2 },
@@ -795,6 +800,14 @@ export default function App() {
             onConfig={updateMiningConfig}
             onStart={startMining}
             onStop={stopMining}
+          />
+        )}
+
+        {section === 'bridge' && (
+          <BridgeView
+            api={api}
+            wallets={state.wallets}
+            selectedWallet={state.wallets.find((w) => w.id === state.selectedWalletId)}
           />
         )}
 
@@ -1694,6 +1707,254 @@ function EmptyState({ title, body }: { title: string; body: string }) {
       <Database size={22} />
       <h3>{title}</h3>
       <p>{body}</p>
+    </div>
+  );
+}
+
+/* ── Bridge ── */
+
+function bridgeFormatBalance(amount: number): string {
+  const v = amount / TOKEN_UNIT;
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(2)}K`;
+  return parseFloat(v.toFixed(8)).toString();
+}
+
+function bridgeTruncAddr(addr: string): string {
+  if (!addr) return '';
+  return `${addr.slice(0, 8)}...${addr.slice(-6)}`;
+}
+
+function bridgeCountdown(targetUnix: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const remaining = targetUnix - now;
+  if (remaining <= 0) return '可领取';
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  return `${hours}h ${minutes}m`;
+}
+
+async function bridgeSignOut(
+  privateKey: string,
+  params: {
+    chainId: string;
+    sender: string;
+    recipient: string;
+    targetChainId: string;
+    amount: number;
+    fee: number;
+    nonce: number;
+  },
+): Promise<{ signature: string; publicKey: string }> {
+  const payload = {
+    chain_id: params.chainId,
+    sender: params.sender,
+    recipient: params.recipient,
+    target_chain_id: params.targetChainId,
+    amount: params.amount,
+    fee: params.fee,
+    nonce: params.nonce,
+  };
+  const jsonStr = JSON.stringify(payload);
+  const hashBytes = new Uint8Array(ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes(jsonStr))));
+  const signingKey = new ethers.SigningKey(privateKey);
+  const signature = signingKey.sign(ethers.hexlify(hashBytes)).serialized;
+  const wallet = new ethers.Wallet(privateKey);
+  const publicKey = wallet.signingKey.publicKey;
+  return { signature, publicKey };
+}
+
+function BridgeView({ api, wallets, selectedWallet }: {
+  api: ChainApi;
+  wallets: WalletRecord[];
+  selectedWallet: WalletRecord | undefined;
+}) {
+  const [amount, setAmount] = useState('');
+  const [ethRecipient, setEthRecipient] = useState('');
+  const [config, setConfig] = useState<BridgeConfig | null>(null);
+  const [outbounds, setOutbounds] = useState<BridgeOutbound[]>([]);
+  const [balance, setBalance] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  const wallet = selectedWallet ?? wallets[0];
+
+  const fetchData = useCallback(async () => {
+    try {
+      const [cfg, pending] = await Promise.all([api.getBridgeConfig(), api.getBridgePending()]);
+      setConfig(cfg);
+      if (wallet) {
+        setOutbounds(pending.outbounds.filter((o) => o.sender.toLowerCase() === wallet.address.toLowerCase()));
+        try {
+          const acc = await api.getAccount(wallet.address);
+          setBalance(acc.balance);
+        } catch { setBalance(null); }
+      }
+    } catch { /* silent */ }
+  }, [api, wallet]);
+
+  useEffect(() => { fetchData(); const id = setInterval(fetchData, 20000); return () => clearInterval(id); }, [fetchData]);
+  useEffect(() => { const id = setInterval(() => setTick((t) => t + 1), 60000); return () => clearInterval(id); }, []);
+  void tick;
+
+  const handleSubmit = async () => {
+    setError(null);
+    setSuccess(null);
+    if (!wallet) { setError('请先创建或选择一个钱包'); return; }
+
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum <= 0) { setError('请输入有效金额'); return; }
+    if (!ethRecipient || !ethers.isAddress(ethRecipient)) { setError('请输入有效的 ETH 接收地址'); return; }
+
+    const amountUnits = Math.round(amountNum * TOKEN_UNIT);
+    if (config && amountUnits < config.minBridgeAmount) {
+      setError(`低于最小跨链数量 (${bridgeFormatBalance(config.minBridgeAmount)} FAL)`);
+      return;
+    }
+    if (balance !== null && amountUnits > balance) { setError('余额不足'); return; }
+
+    setLoading(true);
+    try {
+      const [account, status] = await Promise.all([api.getAccount(wallet.address), api.getStatus()]);
+      const chainId = status.chainId || status.chain_id || 'falari';
+      const targetChainId = config?.targetChainId || 'ethereum';
+
+      const { signature, publicKey } = await bridgeSignOut(wallet.privateKey, {
+        chainId,
+        sender: wallet.address,
+        recipient: ethRecipient,
+        targetChainId,
+        amount: amountUnits,
+        fee: 1,
+        nonce: account.nonce + 1,
+      });
+
+      const result = await api.bridgeOut({
+        sender: wallet.address,
+        recipient: ethRecipient,
+        targetChainId,
+        amount: amountUnits,
+        fee: 1,
+        nonce: account.nonce + 1,
+        signature,
+        publicKey,
+      });
+
+      setSuccess(`跨链请求已提交 #${result.nonce}`);
+      setAmount('');
+      setEthRecipient('');
+      fetchData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '跨链失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const isPaused = config?.paused ?? false;
+
+  return (
+    <div className="two-column">
+      <section className="surface">
+        <div className="section-title">
+          <Link2 size={18} />
+          跨链桥 — FAL → ETH
+        </div>
+
+        {isPaused && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#f87171', fontSize: 13, fontWeight: 600, marginBottom: 12 }}>
+            <AlertTriangle size={14} />
+            跨链桥已暂停
+          </div>
+        )}
+
+        {config && (
+          <div className="detail-grid">
+            <Detail label="最小跨链" value={`${bridgeFormatBalance(config.minBridgeAmount)} FAL`} />
+            <Detail label="延迟时间" value={`${Math.floor(config.delaySeconds / 3600)} 小时`} />
+            <Detail label="池地址" value={bridgeTruncAddr(config.bridgePoolAddress)} />
+            <Detail label="日限额" value={bridgeFormatBalance(config.maxAmountPerDay)} />
+          </div>
+        )}
+
+        {wallet && balance !== null && (
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '12px 0' }}>
+            <span className="mono" style={{ fontSize: 12, opacity: 0.6 }}>{wallet.name} · {bridgeTruncAddr(wallet.address)}</span>
+            <span className="mono" style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent, #00ff66)' }}>{bridgeFormatBalance(balance)} FAL</span>
+          </div>
+        )}
+
+        <div className="form-grid">
+          <label>
+            跨链数量 (FAL)
+            <input
+              type="number"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="0.00"
+              min="0"
+              step="0.01"
+            />
+          </label>
+          <label>
+            ETH 接收地址
+            <input
+              type="text"
+              value={ethRecipient}
+              onChange={(e) => setEthRecipient(e.target.value)}
+              placeholder="0x..."
+            />
+          </label>
+        </div>
+
+        <div className="action-stack">
+          <button className="primary-button" onClick={handleSubmit} disabled={loading || isPaused || !wallet}>
+            {loading ? <><Loader2 size={17} className="spin" /> 跨链中...</> : <><ArrowRight size={17} /> 发起跨链</>}
+          </button>
+          <button className="secondary-button" onClick={fetchData}>
+            <RefreshCw size={17} /> 刷新
+          </button>
+        </div>
+
+        {error && !loading && (
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: 10, borderRadius: 8, background: 'rgba(220,38,38,0.1)', border: '1px solid rgba(220,38,38,0.3)', color: '#f87171', fontSize: 12, marginTop: 12 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+            {error}
+          </div>
+        )}
+        {success && (
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: 10, borderRadius: 8, background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.2)', color: '#4ade80', fontSize: 12, marginTop: 12 }}>
+            <CheckCircle2 size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+            {success}
+          </div>
+        )}
+      </section>
+
+      <section className="surface">
+        <div className="section-title">
+          <Clock size={18} />
+          待处理跨链
+        </div>
+        {outbounds.length === 0 ? (
+          <EmptyState title="暂无待处理" body="发起跨链后会在这里看到进度。" />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {outbounds.map((op) => (
+              <div key={op.nonce} className="detail-grid" style={{ padding: '10px 0', borderBottom: '1px solid var(--border, #222)' }}>
+                <Detail label="#" value={String(op.nonce)} />
+                <Detail label="数量" value={`${bridgeFormatBalance(op.amount)} FAL`} />
+                <Detail label="接收" value={bridgeTruncAddr(op.recipient)} />
+                <Detail label="状态" value={op.status} />
+                {op.claimableAfter > 0 && (
+                  <Detail label="倒计时" value={bridgeCountdown(op.claimableAfter)} />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
