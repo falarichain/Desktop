@@ -5,18 +5,23 @@ import {
   ArrowDownToLine,
   ArrowRight,
   CalendarClock,
+  Check,
   CheckCircle2,
   ChevronRight,
   CircleDollarSign,
   Clock,
   Cloud,
+  Copy,
   Database,
   Download,
+  Eye,
+  EyeOff,
   FileKey2,
   FileLock2,
   FileUp,
   Gauge,
   HardDriveDownload,
+  Key,
   KeyRound,
   Link2,
   Loader2,
@@ -28,6 +33,7 @@ import {
   Server,
   Settings,
   Share2,
+  Shield,
   ShieldCheck,
   Square,
   Trash2,
@@ -53,6 +59,7 @@ import { TOKEN_UNIT } from '@falari-extension/lib/types';
 import { downloadFile, uploadFile } from '@falari-extension/lib/storage';
 import {
   createPasscodeShare,
+  deriveStorageVaultKeyBase64,
   downloadPrivateFile,
   openAddressShare,
   openPasscodeShare,
@@ -138,6 +145,7 @@ interface MinerStats {
   slashed?: number;
   locked_bonus?: number;
   bonus_released?: boolean;
+  bonus_expired?: boolean;
 }
 
 interface ClaimMiningRewardsResponse {
@@ -1027,6 +1035,38 @@ function WalletsView(props: {
   onImport: () => void;
   onFaucet: () => void;
 }) {
+  const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
+  const [vaultKeys, setVaultKeys] = useState<Record<string, string>>({});
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const copyText = async (text: string, key: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2000);
+  };
+
+  const toggleKeys = async (wallet: WalletRecord) => {
+    const isVisible = showKeys[wallet.id];
+    setShowKeys((prev) => ({ ...prev, [wallet.id]: !isVisible }));
+    if (!isVisible && !vaultKeys[wallet.id]) {
+      try {
+        const vk = await deriveStorageVaultKeyBase64(wallet.privateKey, wallet.address);
+        setVaultKeys((prev) => ({ ...prev, [wallet.id]: vk }));
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   return (
     <div className="two-column">
       <section className="surface">
@@ -1054,14 +1094,57 @@ function WalletsView(props: {
         <div className="section-title">本机钱包</div>
         <div className="wallet-list">
           {props.wallets.map((wallet) => (
-            <button key={wallet.id} className={`wallet-row ${props.selectedWalletId === wallet.id ? 'active' : ''}`} onClick={() => props.onSelect(wallet.id)}>
-              <div className="wallet-avatar"><Wallet size={18} /></div>
-              <div>
-                <div>{wallet.name}</div>
-                <div className="mono muted">{wallet.address}</div>
+            <div key={wallet.id}>
+              <div className={`wallet-row ${props.selectedWalletId === wallet.id ? 'active' : ''}`} style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }} onClick={() => props.onSelect(wallet.id)}>
+                <div className="wallet-avatar"><Wallet size={18} /></div>
+                <div style={{ flex: 1 }}>
+                  <div>{wallet.name}</div>
+                  <div className="mono muted">{wallet.address}</div>
+                </div>
+                <button
+                  onClick={(e) => { e.stopPropagation(); toggleKeys(wallet); }}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '4px', color: 'var(--text-dim, #888)' }}
+                  title="导出密钥"
+                >
+                  {showKeys[wallet.id] ? <EyeOff size={16} /> : <Key size={16} />}
+                </button>
+                <ChevronRight size={16} />
               </div>
-              <ChevronRight size={16} />
-            </button>
+              {showKeys[wallet.id] && (
+                <div style={{ padding: '8px 12px 12px 48px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <div style={{ borderRadius: '8px', border: '1px solid rgba(239,68,68,0.2)', background: 'rgba(239,68,68,0.08)', padding: '8px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '11px', fontWeight: 600, color: '#f87171' }}>私钥</span>
+                      <button
+                        onClick={() => copyText(wallet.privateKey, `pk-${wallet.id}`)}
+                        style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '10px', color: '#fca5a5', padding: '2px 6px', borderRadius: '4px' }}
+                      >
+                        {copiedKey === `pk-${wallet.id}` ? <Check size={12} style={{ color: '#4ade80' }} /> : <Copy size={12} />}
+                        {copiedKey === `pk-${wallet.id}` ? '已复制' : '复制'}
+                      </button>
+                    </div>
+                    <code style={{ fontSize: '10px', wordBreak: 'break-all', color: '#fca5a5', lineHeight: 1.5 }}>{wallet.privateKey}</code>
+                    <p style={{ fontSize: '10px', color: 'rgba(252,165,165,0.7)', marginTop: '4px' }}>请离线保存。任何获得它的人都可以控制这个钱包。</p>
+                  </div>
+                  {vaultKeys[wallet.id] && (
+                    <div style={{ borderRadius: '8px', border: '1px solid rgba(245,158,11,0.2)', background: 'rgba(245,158,11,0.08)', padding: '8px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '11px', fontWeight: 600, color: '#fbbf24' }}>Vault Key</span>
+                        <button
+                          onClick={() => copyText(vaultKeys[wallet.id], `vk-${wallet.id}`)}
+                          style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '10px', color: '#fcd34d', padding: '2px 6px', borderRadius: '4px' }}
+                        >
+                          {copiedKey === `vk-${wallet.id}` ? <Check size={12} style={{ color: '#4ade80' }} /> : <Copy size={12} />}
+                          {copiedKey === `vk-${wallet.id}` ? '已复制' : '复制'}
+                        </button>
+                      </div>
+                      <code style={{ fontSize: '10px', wordBreak: 'break-all', color: '#fcd34d', lineHeight: 1.5 }}>{vaultKeys[wallet.id]}</code>
+                      <p style={{ fontSize: '10px', color: 'rgba(252,211,77,0.7)', marginTop: '4px' }}>可解密此地址所有私有数据，但无转账权限。可安全提供给 Agent 使用。</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           ))}
           {props.wallets.length === 0 && <EmptyState title="还没有钱包" body="创建或导入一个钱包后，就可以上传和管理数据。" />}
         </div>
@@ -1497,6 +1580,9 @@ function DataView(props: {
               <Detail label="CID 模式" value={props.selectedAsset.cidMode === 'unique' ? '每人独立' : '共用'} />
               <Detail label="状态" value={props.selectedAsset.status} />
             </div>
+            {props.selectedAsset.access === 'private' && props.selectedAsset.dataKeyBase64 && (
+              <DataKeyBox dataKey={props.selectedAsset.dataKeyBase64} />
+            )}
             <div className="action-stack">
               <button className="primary-button" onClick={() => props.onDownload()} disabled={props.busy === 'download' || !props.selectedAsset.intentId}>
                 {props.busy === 'download' ? <Loader2 className="spin" size={17} /> : <Download size={17} />}
@@ -1745,7 +1831,10 @@ function MiningView(props: {
             return total > 0 ? `${(ok / total * 100).toFixed(1)}%` : 'N/A';
           })()} />
           <Detail label="锁定注册奖金" value={formatTokenAmount(props.minerStats?.locked_bonus)} />
-          <Detail label="奖金已释放" value={props.minerStats?.bonus_released ? '是' : '否'} />
+          <Detail label="奖金状态" value={
+            props.minerStats?.bonus_released ? '已释放' :
+            props.minerStats?.bonus_expired ? '已过期' : '活跃'
+          } />
           <Detail label="有效权重" value={(props.minerStats?.effective_weight ?? 0).toLocaleString()} />
           <Detail label="容量" value={formatSize(props.minerStats?.capacity_bytes ?? props.config.capacity)} />
           <Detail label="已存储" value={formatSize(props.minerStats?.used_bytes ?? 0)} />
@@ -1864,6 +1953,56 @@ function Detail({ label, value }: { label: string; value: string }) {
     <div className="detail-item">
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function DataKeyBox({ dataKey }: { dataKey: string }) {
+  const [show, setShow] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const copyKey = async () => {
+    try {
+      await navigator.clipboard.writeText(dataKey);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = dataKey;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div style={{ borderRadius: '8px', border: '1px solid rgba(59,130,246,0.2)', background: 'rgba(59,130,246,0.08)', padding: '10px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+        <span style={{ fontSize: '12px', fontWeight: 600, color: '#60a5fa' }}>Data Key</span>
+        <div style={{ display: 'flex', gap: '4px' }}>
+          <button
+            onClick={() => setShow(!show)}
+            style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '10px', color: '#93c5fd', padding: '2px 6px', borderRadius: '4px' }}
+          >
+            {show ? <EyeOff size={12} /> : <Eye size={12} />}
+            {show ? '隐藏' : '显示'}
+          </button>
+          <button
+            onClick={copyKey}
+            style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '10px', color: '#93c5fd', padding: '2px 6px', borderRadius: '4px' }}
+          >
+            {copied ? <Check size={12} style={{ color: '#4ade80' }} /> : <Copy size={12} />}
+            {copied ? '已复制' : '复制'}
+          </button>
+        </div>
+      </div>
+      <code style={{ fontSize: '10px', wordBreak: 'break-all', color: '#93c5fd', lineHeight: 1.5 }}>
+        {show ? dataKey : dataKey.slice(0, 16) + '••••••••'}
+      </code>
+      <p style={{ fontSize: '10px', color: 'rgba(147,197,253,0.7)', marginTop: '6px' }}>
+        可解密此条数据。分享给他人即可让其解密该文件。
+      </p>
     </div>
   );
 }
