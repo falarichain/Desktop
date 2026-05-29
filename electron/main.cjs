@@ -23,6 +23,12 @@ function miningStatus() {
   };
 }
 
+function stopMiningProcess() {
+  if (!miningProcess) return;
+  miningProcess.kill('SIGTERM');
+  miningProcess = null;
+}
+
 function chainDir() {
   if (process.env.FALARI_CHAIN_DIR) return process.env.FALARI_CHAIN_DIR;
   return path.resolve(__dirname, '../../chain');
@@ -48,6 +54,10 @@ ipcMain.handle('mining:status', () => miningStatus());
 
 ipcMain.handle('mining:start', (_event, config = {}) => {
   if (miningProcess) return miningStatus();
+  const minerPrivateKey = config.minerPrivateKey || process.env.MINER_PRIVATE_KEY;
+  if (!minerPrivateKey) {
+    throw new Error('请先选择一个本地钱包，或设置 MINER_PRIVATE_KEY 后再开启挖矿。');
+  }
   const { command, args, cwd } = miningCommand(config);
   const finalArgs = [
     ...args,
@@ -62,7 +72,13 @@ ipcMain.handle('mining:start', (_event, config = {}) => {
   if (config.p2pPeers) finalArgs.push('-p2p-peers', config.p2pPeers);
   miningLogs = [];
   appendMiningLog(`starting mining node: ${command} ${finalArgs.join(' ')}`);
-  miningProcess = spawn(command, finalArgs, { cwd, env: process.env });
+  miningProcess = spawn(command, finalArgs, {
+    cwd,
+    env: {
+      ...process.env,
+      MINER_PRIVATE_KEY: minerPrivateKey,
+    },
+  });
   miningProcess.stdout.on('data', (chunk) => appendMiningLog(chunk));
   miningProcess.stderr.on('data', (chunk) => appendMiningLog(chunk));
   miningProcess.on('exit', (code, signal) => {
@@ -76,9 +92,7 @@ ipcMain.handle('mining:start', (_event, config = {}) => {
 });
 
 ipcMain.handle('mining:stop', () => {
-  if (miningProcess) {
-    miningProcess.kill('SIGTERM');
-  }
+  stopMiningProcess();
   return miningStatus();
 });
 
@@ -108,6 +122,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
   });
 
@@ -119,7 +136,14 @@ function createWindow() {
   }
 
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (['https:', 'http:', 'mailto:'].includes(parsed.protocol)) {
+        shell.openExternal(url);
+      }
+    } catch {
+      // Ignore malformed external URLs.
+    }
     return { action: 'deny' };
   });
 }
@@ -131,10 +155,11 @@ app.whenReady().then(() => {
   });
 });
 
+app.on('before-quit', () => {
+  stopMiningProcess();
+});
+
 app.on('window-all-closed', () => {
-  if (miningProcess) {
-    miningProcess.kill('SIGTERM');
-    miningProcess = null;
-  }
+  stopMiningProcess();
   if (process.platform !== 'darwin') app.quit();
 });

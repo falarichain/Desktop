@@ -117,6 +117,38 @@ interface MiningRuntime {
   logs: string[];
 }
 
+interface MinerStats {
+  miner_address?: string;
+  status?: string;
+  proof_success?: number;
+  proof_failure?: number;
+  rewards?: number;
+  storage_rewards?: number;
+  unsettled_storage_rewards?: number;
+  estimated_storage_rewards?: number;
+  storage_reward_accrued?: number;
+  retrieval_rewards?: number;
+  repair_rewards?: number;
+  pending_mining_rewards?: number;
+  vesting_mining_rewards?: number;
+  claimable_mining_rewards?: number;
+  effective_weight?: number;
+  capacity_bytes?: number;
+  used_bytes?: number;
+  slashed?: number;
+  locked_bonus?: number;
+  bonus_released?: boolean;
+}
+
+interface ClaimMiningRewardsResponse {
+  miner_address: string;
+  claimed: number;
+  balance: number;
+  pending_mining_rewards?: number;
+  vesting_mining_rewards?: number;
+  claimable_mining_rewards?: number;
+}
+
 const STORAGE_KEY = 'falari_desktop_state_v1';
 const defaultState: DesktopState = {
   wallets: [],
@@ -158,7 +190,7 @@ declare global {
       platform: string;
       version: string;
       miningStatus: () => Promise<MiningRuntime>;
-      startMining: (config: MiningConfig & { chainUrl: string }) => Promise<MiningRuntime>;
+      startMining: (config: MiningConfig & { chainUrl: string; minerAddress?: string; minerPrivateKey?: string }) => Promise<MiningRuntime>;
       stopMining: () => Promise<MiningRuntime>;
       safeStorageAvailable: () => Promise<boolean>;
       encryptSecret: (plaintext: string) => Promise<string | null>;
@@ -220,9 +252,23 @@ function formatSize(bytes: number) {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
+function formatTokenAmount(amount?: number) {
+  const units = Number(amount || 0) / TOKEN_UNIT;
+  if (units >= 1_000_000) return `${(units / 1_000_000).toFixed(2)}M GF`;
+  if (units >= 1_000) return `${(units / 1_000).toFixed(2)}K GF`;
+  return `${parseFloat(units.toFixed(8)).toString()} GF`;
+}
+
 function shortAddress(address?: string) {
   if (!address) return '未选择';
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+async function getWire<T>(chainUrl: string, path: string): Promise<T> {
+  const resp = await fetch(`${chainUrl.replace(/\/$/, '')}${path}`);
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(text || `HTTP ${resp.status}`);
+  return text ? JSON.parse(text) as T : undefined as T;
 }
 
 function nowUnix() {
@@ -254,6 +300,22 @@ async function postWire<T>(chainUrl: string, path: string, body: unknown): Promi
   return text ? JSON.parse(text) as T : undefined as T;
 }
 
+function signClaimMiningRewards(privateKey: string, params: {
+  chainId: string;
+  minerAddress: string;
+  nonce: number;
+}) {
+  const payload = {
+    action: 'claim_mining_rewards',
+    chain_id: params.chainId,
+    miner_address: params.minerAddress,
+    nonce: params.nonce,
+  };
+  const digest = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(payload)));
+  const signingKey = new ethers.SigningKey(privateKey);
+  return signingKey.sign(digest).serialized;
+}
+
 function toWirePayload(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(toWirePayload);
   if (!value || typeof value !== 'object') return value;
@@ -269,6 +331,8 @@ export default function App() {
   const [query, setQuery] = useState('');
   const [selectedAssetId, setSelectedAssetId] = useState<string | undefined>();
   const [chainStatus, setChainStatus] = useState<any>(null);
+  const [minerStats, setMinerStats] = useState<MinerStats | null>(null);
+  const [minerStatsError, setMinerStatsError] = useState('');
   const [miningRuntime, setMiningRuntime] = useState<MiningRuntime>({ running: false, logs: [] });
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState('');
@@ -293,6 +357,22 @@ export default function App() {
     const haystack = `${asset.fileName} ${asset.intentId} ${asset.status}`.toLowerCase();
     return haystack.includes(query.toLowerCase());
   });
+
+  const refreshMinerStats = useCallback(async () => {
+    if (!selectedWallet) {
+      setMinerStats(null);
+      setMinerStatsError('');
+      return;
+    }
+    try {
+      const stats = await getWire<MinerStats>(state.chainUrl, `/miners/${encodeURIComponent(selectedWallet.address)}`);
+      setMinerStats(stats?.miner_address ? stats : null);
+      setMinerStatsError('');
+    } catch (err) {
+      setMinerStats(null);
+      setMinerStatsError(err instanceof Error ? err.message : '读取矿工收益失败');
+    }
+  }, [selectedWallet, state.chainUrl]);
 
   useEffect(() => {
     saveState(state);
@@ -343,6 +423,12 @@ export default function App() {
     };
   }, [api]);
 
+  useEffect(() => {
+    refreshMinerStats();
+    const timer = window.setInterval(refreshMinerStats, 15000);
+    return () => window.clearInterval(timer);
+  }, [refreshMinerStats]);
+
   function patchState(update: Partial<DesktopState>) {
     setState((current) => ({ ...current, ...update }));
   }
@@ -366,10 +452,20 @@ export default function App() {
       setNotice('当前运行环境不支持启动本地挖矿节点。');
       return;
     }
+    if (!selectedWallet?.privateKey) {
+      setNotice('请先创建或选择一个钱包，用这个钱包作为矿工地址启动挖矿。');
+      return;
+    }
     setBusy('mining');
     try {
-      const status = await window.falariDesktop.startMining({ ...state.mining, chainUrl: state.chainUrl });
+      const status = await window.falariDesktop.startMining({
+        ...state.mining,
+        chainUrl: state.chainUrl,
+        minerAddress: selectedWallet.address,
+        minerPrivateKey: selectedWallet.privateKey,
+      });
       setMiningRuntime(status);
+      await refreshMinerStats();
       setNotice('挖矿已开启，本地节点会同时提供上传和下载访问服务。');
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '启动挖矿失败');
@@ -387,6 +483,36 @@ export default function App() {
       setNotice('挖矿停止中，节点会停止提供访问服务。');
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '停止挖矿失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function claimMiningRewards() {
+    if (!selectedWallet?.privateKey) {
+      setNotice('请先选择矿工钱包。');
+      return;
+    }
+    setBusy('claim-mining-rewards');
+    try {
+      const [account, status] = await Promise.all([api.getAccount(selectedWallet.address), api.getStatus()]);
+      const chainId = status.chainId || status.chain_id || 'falari-dev';
+      const nonce = account.nonce;
+      const signature = signClaimMiningRewards(selectedWallet.privateKey, {
+        chainId,
+        minerAddress: selectedWallet.address,
+        nonce,
+      });
+      const resp = await postWire<ClaimMiningRewardsResponse>(state.chainUrl, '/miners/claim-rewards', {
+        minerAddress: selectedWallet.address,
+        chainId,
+        nonce,
+        signature,
+      });
+      await refreshMinerStats();
+      setNotice(`已领取 ${formatTokenAmount(resp.claimed)}，新的可用余额 ${formatTokenAmount(resp.balance)}。`);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '领取挖矿奖励失败');
     } finally {
       setBusy('');
     }
@@ -795,11 +921,16 @@ export default function App() {
           <MiningView
             config={state.mining}
             chainUrl={state.chainUrl}
+            selectedWallet={selectedWallet}
+            minerStats={minerStats}
+            minerStatsError={minerStatsError}
             runtime={miningRuntime}
             busy={busy}
             onConfig={updateMiningConfig}
             onStart={startMining}
             onStop={stopMining}
+            onRefreshRewards={refreshMinerStats}
+            onClaimRewards={claimMiningRewards}
           />
         )}
 
@@ -1548,13 +1679,24 @@ function SharesView(props: {
 function MiningView(props: {
   config: MiningConfig;
   chainUrl: string;
+  selectedWallet?: WalletRecord;
+  minerStats: MinerStats | null;
+  minerStatsError: string;
   runtime: MiningRuntime;
   busy: string;
   onConfig: (patch: Partial<MiningConfig>) => void;
   onStart: () => void;
   onStop: () => void;
+  onRefreshRewards: () => void;
+  onClaimRewards: () => void;
 }) {
   const canControl = Boolean(window.falariDesktop);
+  const estimatedStorage = props.minerStats?.estimated_storage_rewards ?? 0;
+  const unsettledStorage = props.minerStats?.unsettled_storage_rewards ?? 0;
+  const pendingMining = props.minerStats?.pending_mining_rewards ?? 0;
+  const vestingMining = props.minerStats?.vesting_mining_rewards ?? 0;
+  const claimableMining = props.minerStats?.claimable_mining_rewards ?? 0;
+  const totalRewards = props.minerStats?.rewards ?? 0;
   return (
     <div className="two-column">
       <section className="surface">
@@ -1567,6 +1709,8 @@ function MiningView(props: {
           </div>
         </div>
         <div className="detail-grid">
+          <Detail label="矿工地址" value={props.selectedWallet ? shortAddress(props.selectedWallet.address) : '未选择钱包'} />
+          <Detail label="链上状态" value={props.minerStats?.status || '未注册'} />
           <Detail label="链节点" value={props.chainUrl} />
           <Detail label="访问入口" value={props.config.endpoint} />
           <Detail label="监听端口" value={props.config.addr} />
@@ -1582,6 +1726,41 @@ function MiningView(props: {
             停止
           </button>
         </div>
+      </section>
+
+      <section className="surface">
+        <div className="section-title">挖矿奖励</div>
+        <div className="detail-grid">
+          <Detail label="总挖矿收益" value={formatTokenAmount(totalRewards)} />
+          <Detail label="存储收益累计" value={formatTokenAmount(props.minerStats?.storage_rewards)} />
+          <Detail label="预估未结算" value={formatTokenAmount(unsettledStorage || estimatedStorage)} />
+          <Detail label="已结算总额" value={formatTokenAmount(pendingMining)} />
+          <Detail label="30 天释放中" value={formatTokenAmount(vestingMining)} />
+          <Detail label="当前可领取" value={formatTokenAmount(claimableMining)} />
+          <Detail label="证明成功次数" value={String(props.minerStats?.proof_success ?? 0)} />
+          <Detail label="成功率" value={(() => {
+            const ok = props.minerStats?.proof_success ?? 0;
+            const fail = props.minerStats?.proof_failure ?? 0;
+            const total = ok + fail;
+            return total > 0 ? `${(ok / total * 100).toFixed(1)}%` : 'N/A';
+          })()} />
+          <Detail label="锁定注册奖金" value={formatTokenAmount(props.minerStats?.locked_bonus)} />
+          <Detail label="奖金已释放" value={props.minerStats?.bonus_released ? '是' : '否'} />
+          <Detail label="有效权重" value={(props.minerStats?.effective_weight ?? 0).toLocaleString()} />
+          <Detail label="容量" value={formatSize(props.minerStats?.capacity_bytes ?? props.config.capacity)} />
+          <Detail label="已存储" value={formatSize(props.minerStats?.used_bytes ?? 0)} />
+        </div>
+        <div className="action-stack">
+          <button className="primary-button" onClick={props.onClaimRewards} disabled={!props.selectedWallet || claimableMining <= 0 || props.busy === 'claim-mining-rewards'}>
+            {props.busy === 'claim-mining-rewards' ? <Loader2 className="spin" size={17} /> : <CircleDollarSign size={17} />}
+            领取已成熟奖励
+          </button>
+          <button className="secondary-button" onClick={props.onRefreshRewards}>
+            <RefreshCw size={17} />
+            刷新奖励
+          </button>
+        </div>
+        {props.minerStatsError && <p className="muted small">{props.minerStatsError}</p>}
       </section>
 
       <section className="surface">
