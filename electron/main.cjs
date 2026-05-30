@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, shell, safeStorage } = require('electron');
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 let miningProcess = null;
@@ -94,6 +95,25 @@ ipcMain.handle('mining:start', (_event, config = {}) => {
 ipcMain.handle('mining:stop', () => {
   stopMiningProcess();
   return miningStatus();
+});
+
+ipcMain.handle('disk:freeSpace', async (_event, dirPath) => {
+  const target = dirPath || app.getPath('userData');
+  // Walk up to the nearest existing ancestor directory.
+  let check = target;
+  while (check && check !== path.dirname(check)) {
+    try {
+      fs.accessSync(check);
+      break;
+    } catch {
+      check = path.dirname(check);
+    }
+  }
+  const stat = await fs.promises.statfs(check);
+  return {
+    freeBytes: stat.bavail * stat.bsize,
+    totalBytes: stat.blocks * stat.bsize,
+  };
 });
 
 ipcMain.handle('safeStorage:available', () => safeStorage.isEncryptionAvailable());

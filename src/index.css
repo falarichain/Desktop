@@ -709,6 +709,152 @@ button:disabled {
   color: #9da6b3;
 }
 
+/* ── Bonus quota & capacity selector ── */
+
+.bonus-quota {
+  display: grid;
+  gap: 10px;
+}
+
+.bonus-progress {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.bonus-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: #1a1f27;
+  overflow: hidden;
+}
+
+.bonus-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: #54d18a;
+  transition: width 0.4s ease;
+}
+
+.bonus-hint {
+  font-size: 13px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  border-radius: 8px;
+}
+
+.bonus-hint.ok {
+  border: 1px solid #294537;
+  background: #102019;
+  color: #cef4dc;
+}
+
+.bonus-hint.warn {
+  border: 1px solid #563039;
+  background: #221015;
+  color: #ffb6c1;
+}
+
+.capacity-input-group {
+  display: flex;
+  gap: 0;
+}
+
+.capacity-input-group input {
+  border-radius: 8px 0 0 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.unit-toggle {
+  display: flex;
+  border: 1px solid #2a313b;
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  overflow: hidden;
+}
+
+.unit-btn {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  border: 0;
+  background: #0c1014;
+  color: #87909d;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.unit-btn:not(:last-child) {
+  border-right: 1px solid #2a313b;
+}
+
+.unit-btn.active {
+  background: #222933;
+  color: #ffffff;
+}
+
+.field-hint {
+  display: block;
+  font-size: 12px;
+  color: #87909d;
+  line-height: 1.45;
+}
+
+.field-hint.error {
+  color: #ff8a9b;
+}
+
+.input-error {
+  border-color: #8b3a46 !important;
+}
+
+.input-with-action {
+  display: flex;
+  gap: 0;
+}
+
+.input-with-action input {
+  border-radius: 8px 0 0 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.input-with-action .icon-button {
+  width: 38px;
+  height: 38px;
+  border-radius: 0 8px 8px 0;
+  border-left: 0;
+}
+
+.disk-info-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid #28313b;
+  border-radius: 8px;
+  background: #0d1116;
+  color: #87909d;
+  font-size: 12px;
+}
+
+.disk-info-bar .error {
+  color: #ff8a9b;
+}
+
+.capacity-adjust-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
 .spin {
   animation: spin 0.9s linear infinite;
 }

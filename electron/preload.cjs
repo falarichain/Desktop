@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('falariDesktop', {
   miningStatus: () => ipcRenderer.invoke('mining:status'),
   startMining: (config) => ipcRenderer.invoke('mining:start', config),
   stopMining: () => ipcRenderer.invoke('mining:stop'),
+  getDiskFreeSpace: (dirPath) => ipcRenderer.invoke('disk:freeSpace', dirPath),
   safeStorageAvailable: () => ipcRenderer.invoke('safeStorage:available'),
   encryptSecret: (plaintext) => ipcRenderer.invoke('safeStorage:encrypt', plaintext),
   decryptSecret: (base64) => ipcRenderer.invoke('safeStorage:decrypt', base64),

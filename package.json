@@ -17,13 +17,16 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
+  "overrides": {
+    "ws": "^8.20.1"
+  },
   "devDependencies": {
     "@types/node": "^22.5.4",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
-    "electron": "^31.6.0",
+    "@vitejs/plugin-react": "^6.0.2",
+    "electron": "^42.3.0",
     "typescript": "^5.5.4",
-    "vite": "^5.4.2"
+    "vite": "^8.0.14"
   }
 }

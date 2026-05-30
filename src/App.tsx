@@ -126,6 +126,7 @@ interface MiningRuntime {
 
 interface MinerStats {
   miner_address?: string;
+  miner_id?: number;
   status?: string;
   proof_success?: number;
   proof_failure?: number;
@@ -146,6 +147,7 @@ interface MinerStats {
   locked_bonus?: number;
   bonus_released?: boolean;
   bonus_expired?: boolean;
+  last_capacity_adjust_unix?: number;
 }
 
 interface ClaimMiningRewardsResponse {
@@ -200,6 +202,7 @@ declare global {
       miningStatus: () => Promise<MiningRuntime>;
       startMining: (config: MiningConfig & { chainUrl: string; minerAddress?: string; minerPrivateKey?: string }) => Promise<MiningRuntime>;
       stopMining: () => Promise<MiningRuntime>;
+      getDiskFreeSpace: (dirPath?: string) => Promise<{ freeBytes: number; totalBytes: number }>;
       safeStorageAvailable: () => Promise<boolean>;
       encryptSecret: (plaintext: string) => Promise<string | null>;
       decryptSecret: (base64: string) => Promise<string | null>;
@@ -324,6 +327,24 @@ function signClaimMiningRewards(privateKey: string, params: {
   return signingKey.sign(digest).serialized;
 }
 
+function signAdjustCapacity(privateKey: string, params: {
+  chainId: string;
+  minerAddress: string;
+  newCapacityBytes: number;
+  nonce: number;
+}) {
+  const payload = {
+    action: 'adjust_capacity',
+    chain_id: params.chainId,
+    miner_address: params.minerAddress,
+    new_capacity_bytes: params.newCapacityBytes,
+    nonce: params.nonce,
+  };
+  const digest = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(payload)));
+  const signingKey = new ethers.SigningKey(privateKey);
+  return signingKey.sign(digest).serialized;
+}
+
 function toWirePayload(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(toWirePayload);
   if (!value || typeof value !== 'object') return value;
@@ -356,6 +377,8 @@ export default function App() {
   const [openAccessCode, setOpenAccessCode] = useState('');
   const [renewDuration, setRenewDuration] = useState(durationOptions[1].value);
   const [topUpAmount, setTopUpAmount] = useState(1000000);
+  const [diskInfo, setDiskInfo] = useState<{ freeBytes: number; totalBytes: number } | null>(null);
+  const [capacityUnit, setCapacityUnit] = useState<'TB' | 'GB'>('TB');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const api = useMemo(() => new ChainApi(state.chainUrl), [state.chainUrl]);
@@ -437,6 +460,20 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [refreshMinerStats]);
 
+  const refreshDiskInfo = useCallback(async () => {
+    if (!window.falariDesktop) return;
+    try {
+      const info = await window.falariDesktop.getDiskFreeSpace(state.mining.dataDir);
+      setDiskInfo(info);
+    } catch {
+      setDiskInfo(null);
+    }
+  }, [state.mining.dataDir]);
+
+  useEffect(() => {
+    refreshDiskInfo();
+  }, [refreshDiskInfo]);
+
   function patchState(update: Partial<DesktopState>) {
     setState((current) => ({ ...current, ...update }));
   }
@@ -464,6 +501,44 @@ export default function App() {
       setNotice('请先创建或选择一个钱包，用这个钱包作为矿工地址启动挖矿。');
       return;
     }
+
+    // Pre-flight: check disk free space.
+    const MIN_CAP = chainStatus?.minCapacityBytes ?? 200 * 1024 ** 3;
+    try {
+      const disk = await window.falariDesktop.getDiskFreeSpace(state.mining.dataDir);
+      setDiskInfo(disk);
+      if (disk.freeBytes < MIN_CAP) {
+        setNotice(`磁盘剩余空间不足（${formatSize(disk.freeBytes)}），最低要求 ${formatSize(MIN_CAP)}，无法启动挖矿。`);
+        return;
+      }
+      if (disk.freeBytes < state.mining.capacity) {
+        setNotice(`磁盘剩余空间（${formatSize(disk.freeBytes)}）小于设定的挖矿容量（${formatSize(state.mining.capacity)}），请先清理磁盘或减少挖矿容量。`);
+        return;
+      }
+    } catch {
+      setNotice('无法读取磁盘空间信息，请确认数据目录路径正确。');
+      return;
+    }
+
+    // Pre-flight: check bonus quota & stake requirement.
+    const stakePerTiB = chainStatus?.stakePerTiB ?? 1000 * TOKEN_UNIT;
+    const bonusAmount = chainStatus?.registrationBonusAmount ?? 5000 * TOKEN_UNIT;
+    const bonusGranted = chainStatus?.bonusGrantedCount ?? 0;
+    const bonusMax = chainStatus?.maxBonusAddresses ?? 200_000;
+    const bonusAvailable = bonusGranted < bonusMax;
+    const TiB = 1024 ** 4;
+    const tibCount = Math.ceil(state.mining.capacity / TiB);
+    const requiredStake = tibCount * stakePerTiB;
+    if (!bonusAvailable && requiredStake > 0) {
+      // Bonus slots exhausted — user must self-fund the full stake.
+      // The mining node will enforce this; we just warn the user here.
+      const userStake = state.mining.stake * TOKEN_UNIT;
+      if (userStake < requiredStake) {
+        setNotice(`奖励名额已满（${bonusGranted.toLocaleString()}/${bonusMax.toLocaleString()}），您需要自行质押 ${formatTokenAmount(requiredStake)} Token，当前设置仅 ${formatTokenAmount(userStake)}。`);
+        return;
+      }
+    }
+
     setBusy('mining');
     try {
       const status = await window.falariDesktop.startMining({
@@ -521,6 +596,40 @@ export default function App() {
       setNotice(`已领取 ${formatTokenAmount(resp.claimed)}，新的可用余额 ${formatTokenAmount(resp.balance)}。`);
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '领取挖矿奖励失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function adjustCapacity(newCapacityBytes: number) {
+    if (!selectedWallet?.privateKey) {
+      setNotice('请先选择矿工钱包。');
+      return;
+    }
+    setBusy('adjust-capacity');
+    try {
+      const [account, status] = await Promise.all([api.getAccount(selectedWallet.address), api.getStatus()]);
+      const chainId = status.chainId || status.chain_id || 'falari-dev';
+      const nonce = account.nonce;
+      const signature = signAdjustCapacity(selectedWallet.privateKey, {
+        chainId,
+        minerAddress: selectedWallet.address,
+        newCapacityBytes,
+        nonce,
+      });
+      const resp = await postWire<{ miner: MinerStats; refund_unbonding?: number }>(
+        state.chainUrl, '/miners/adjust-capacity',
+        { minerAddress: selectedWallet.address, newCapacityBytes, chainId, nonce, signature },
+      );
+      await refreshMinerStats();
+      const refund = resp.refund_unbonding ?? 0;
+      if (refund > 0) {
+        setNotice(`容量已调整为 ${formatSize(newCapacityBytes)}，退还 ${formatTokenAmount(refund)} 将在 7 天后到账。`);
+      } else {
+        setNotice(`容量已调整为 ${formatSize(newCapacityBytes)}。`);
+      }
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '调整容量失败');
     } finally {
       setBusy('');
     }
@@ -929,16 +1038,22 @@ export default function App() {
           <MiningView
             config={state.mining}
             chainUrl={state.chainUrl}
+            chainStatus={chainStatus}
             selectedWallet={selectedWallet}
             minerStats={minerStats}
             minerStatsError={minerStatsError}
             runtime={miningRuntime}
             busy={busy}
+            diskInfo={diskInfo}
+            capacityUnit={capacityUnit}
+            onCapacityUnit={setCapacityUnit}
             onConfig={updateMiningConfig}
             onStart={startMining}
             onStop={stopMining}
             onRefreshRewards={refreshMinerStats}
+            onRefreshDisk={refreshDiskInfo}
             onClaimRewards={claimMiningRewards}
+            onAdjustCapacity={adjustCapacity}
           />
         )}
 
@@ -1765,16 +1880,22 @@ function SharesView(props: {
 function MiningView(props: {
   config: MiningConfig;
   chainUrl: string;
+  chainStatus: any;
   selectedWallet?: WalletRecord;
   minerStats: MinerStats | null;
   minerStatsError: string;
   runtime: MiningRuntime;
   busy: string;
+  diskInfo: { freeBytes: number; totalBytes: number } | null;
+  capacityUnit: 'TB' | 'GB';
+  onCapacityUnit: (unit: 'TB' | 'GB') => void;
   onConfig: (patch: Partial<MiningConfig>) => void;
   onStart: () => void;
   onStop: () => void;
   onRefreshRewards: () => void;
+  onRefreshDisk: () => void;
   onClaimRewards: () => void;
+  onAdjustCapacity: (newCapacityBytes: number) => void;
 }) {
   const canControl = Boolean(window.falariDesktop);
   const estimatedStorage = props.minerStats?.estimated_storage_rewards ?? 0;
@@ -1783,6 +1904,51 @@ function MiningView(props: {
   const vestingMining = props.minerStats?.vesting_mining_rewards ?? 0;
   const claimableMining = props.minerStats?.claimable_mining_rewards ?? 0;
   const totalRewards = props.minerStats?.rewards ?? 0;
+
+  // Capacity unit conversion.
+  const TiB = 1024 ** 4;
+  const GiB = 1024 ** 3;
+  const divisor = props.capacityUnit === 'TB' ? TiB : GiB;
+  const capacityDisplay = +(props.config.capacity / divisor).toFixed(4);
+  const minCapBytes = props.chainStatus?.minCapacityBytes ?? 200 * GiB;
+  const minCapDisplay = +(minCapBytes / divisor).toFixed(2);
+
+  function onCapacityChange(raw: string) {
+    const val = parseFloat(raw);
+    if (isNaN(val) || val < 0) return;
+    props.onConfig({ capacity: Math.round(val * divisor) });
+  }
+
+  // Stake calculation.
+  const stakePerTiB = props.chainStatus?.stakePerTiB ?? 1000 * TOKEN_UNIT;
+  const bonusAmount = props.chainStatus?.registrationBonusAmount ?? 5000 * TOKEN_UNIT;
+  const tibCount = Math.ceil(props.config.capacity / TiB);
+  const requiredStake = tibCount * stakePerTiB;
+  const bonusGranted = props.chainStatus?.bonusGrantedCount ?? 0;
+  const bonusMax = props.chainStatus?.maxBonusAddresses ?? 200_000;
+  const bonusAvailable = bonusGranted < bonusMax;
+  const bonusCoversAll = bonusAvailable && bonusAmount >= requiredStake;
+  const additionalStakeNeeded = bonusAvailable
+    ? Math.max(0, requiredStake - bonusAmount)
+    : requiredStake;
+
+  // Disk space validation hints.
+  const diskFree = props.diskInfo?.freeBytes ?? 0;
+  const diskTotal = props.diskInfo?.totalBytes ?? 0;
+  const capacityExceedsDisk = props.config.capacity > diskFree;
+  const belowMinimum = props.config.capacity < minCapBytes;
+
+  // Capacity adjustment cooldown.
+  const cooldownSeconds = 7 * 24 * 60 * 60; // 7 days
+  const lastAdjust = props.minerStats?.last_capacity_adjust_unix ?? 0;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const cooldownRemaining = lastAdjust > 0 ? Math.max(0, cooldownSeconds - (nowSec - lastAdjust)) : 0;
+  const cooldownDays = Math.floor(cooldownRemaining / 86400);
+  const cooldownHours = Math.floor((cooldownRemaining % 86400) / 3600);
+  const onCooldown = cooldownRemaining > 0;
+  const isRegistered = Boolean(props.minerStats?.miner_address);
+  const capacityChanged = isRegistered && props.config.capacity !== (props.minerStats?.capacity_bytes ?? 0);
+
   return (
     <div className="two-column">
       <section className="surface">
@@ -1796,6 +1962,7 @@ function MiningView(props: {
         </div>
         <div className="detail-grid">
           <Detail label="矿工地址" value={props.selectedWallet ? shortAddress(props.selectedWallet.address) : '未选择钱包'} />
+          <Detail label="挖矿编号" value={props.minerStats?.miner_id ? `#${String(props.minerStats.miner_id).padStart(4, '0')}` : '-'} />
           <Detail label="链上状态" value={props.minerStats?.status || '未注册'} />
           <Detail label="链节点" value={props.chainUrl} />
           <Detail label="访问入口" value={props.config.endpoint} />
@@ -1853,6 +2020,32 @@ function MiningView(props: {
       </section>
 
       <section className="surface">
+        <div className="section-title">奖励名额</div>
+        <div className="bonus-quota">
+          <div className="bonus-progress">
+            <span className="muted">已使用</span>
+            <strong>{bonusGranted.toLocaleString()} / {bonusMax.toLocaleString()}</strong>
+            <span className="muted">（剩余 {(bonusMax - bonusGranted).toLocaleString()} 个）</span>
+          </div>
+          <div className="bonus-bar-track">
+            <div className="bonus-bar-fill" style={{ width: `${Math.min(100, bonusMax > 0 ? (bonusGranted / bonusMax) * 100 : 0)}%` }} />
+          </div>
+          {bonusAvailable ? (
+            <div className="bonus-hint ok">
+              当前仍有名额，注册可获得 {formatTokenAmount(bonusAmount)} 奖励。
+              {bonusCoversAll
+                ? ' 此奖励可完全覆盖质押需求，无需额外质押。'
+                : ` 奖励可覆盖 ${formatTokenAmount(bonusAmount)} 质押，超出部分需自行质押 ${formatTokenAmount(additionalStakeNeeded)}。`}
+            </div>
+          ) : (
+            <div className="bonus-hint warn">
+              20 万个奖励名额已全部用完，您需要根据挖矿容量自行质押 Token。
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="surface">
         <div className="section-title">节点配置</div>
         <div className="form-grid">
           <label>
@@ -1865,15 +2058,78 @@ function MiningView(props: {
           </label>
           <label>
             数据目录
-            <input value={props.config.dataDir} onChange={(event) => props.onConfig({ dataDir: event.target.value })} />
+            <div className="input-with-action">
+              <input value={props.config.dataDir} onChange={(event) => props.onConfig({ dataDir: event.target.value })} />
+              <button className="icon-button" title="刷新磁盘空间" onClick={props.onRefreshDisk}><RefreshCw size={14} /></button>
+            </div>
           </label>
           <label>
-            质押数量
-            <input type="number" value={props.config.stake} onChange={(event) => props.onConfig({ stake: Number(event.target.value) })} />
+            质押数量 (Token)
+            <input type="number" min={0} value={props.config.stake} onChange={(event) => props.onConfig({ stake: Number(event.target.value) })} />
+            {!bonusCoversAll && (
+              <span className="field-hint">
+                最低需质押 {formatTokenAmount(requiredStake)}（每 TiB {formatTokenAmount(stakePerTiB)}）
+                {additionalStakeNeeded > 0 && bonusAvailable
+                  ? `，扣除奖励后还需 ${formatTokenAmount(additionalStakeNeeded)}`
+                  : ''}
+              </span>
+            )}
           </label>
           <label>
-            容量字节
-            <input type="number" value={props.config.capacity} onChange={(event) => props.onConfig({ capacity: Number(event.target.value) })} />
+            挖矿容量
+            <div className="capacity-input-group">
+              <input
+                type="number"
+                min={0}
+                step={props.capacityUnit === 'TB' ? 0.1 : 1}
+                value={capacityDisplay}
+                onChange={(event) => onCapacityChange(event.target.value)}
+                className={belowMinimum || capacityExceedsDisk ? 'input-error' : ''}
+              />
+              <div className="unit-toggle">
+                <button
+                  className={`unit-btn ${props.capacityUnit === 'TB' ? 'active' : ''}`}
+                  onClick={() => {
+                    props.onCapacityUnit('TB');
+                    props.onConfig({ capacity: props.config.capacity }); // keep internal bytes
+                  }}
+                >TB</button>
+                <button
+                  className={`unit-btn ${props.capacityUnit === 'GB' ? 'active' : ''}`}
+                  onClick={() => {
+                    props.onCapacityUnit('GB');
+                    props.onConfig({ capacity: props.config.capacity });
+                  }}
+                >GB</button>
+              </div>
+            </div>
+            {belowMinimum && (
+              <span className="field-hint error">最低要求 {minCapDisplay} {props.capacityUnit}</span>
+            )}
+            {capacityExceedsDisk && diskFree > 0 && (
+              <span className="field-hint error">超出磁盘剩余空间（{formatSize(diskFree)}）</span>
+            )}
+            <span className="field-hint">
+              需质押 {formatTokenAmount(requiredStake)}（{tibCount} TiB x {formatTokenAmount(stakePerTiB)}）
+            </span>
+            {isRegistered && capacityChanged && (
+              <div className="capacity-adjust-row">
+                <button
+                  className="secondary-button"
+                  disabled={onCooldown || belowMinimum || capacityExceedsDisk || props.busy === 'adjust-capacity'}
+                  onClick={() => props.onAdjustCapacity(props.config.capacity)}
+                >
+                  {props.busy === 'adjust-capacity' ? <Loader2 className="spin" size={15} /> : null}
+                  应用容量变更
+                </button>
+                {onCooldown && (
+                  <span className="field-hint">冷却中：{cooldownDays} 天 {cooldownHours} 小时后可再次调整</span>
+                )}
+              </div>
+            )}
+            {isRegistered && !capacityChanged && onCooldown && (
+              <span className="field-hint">上次调整冷却中：{cooldownDays} 天 {cooldownHours} 小时后可再次调整</span>
+            )}
           </label>
           <label>
             P2P 监听
@@ -1884,6 +2140,15 @@ function MiningView(props: {
             <input value={props.config.p2pPeers} onChange={(event) => props.onConfig({ p2pPeers: event.target.value })} placeholder="多个地址用英文逗号分隔" />
           </label>
         </div>
+        {props.diskInfo && (
+          <div className="disk-info-bar">
+            <span>磁盘空间：总计 {formatSize(diskTotal)}</span>
+            <span>剩余 {formatSize(diskFree)}</span>
+            <span className={capacityExceedsDisk ? 'error' : ''}>
+              挖矿占用 {formatSize(props.config.capacity)}
+            </span>
+          </div>
+        )}
       </section>
 
       <section className="surface wide-panel">
