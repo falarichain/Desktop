@@ -865,6 +865,73 @@ button:disabled {
   }
 }
 
+/* Miner NFT */
+.miner-nft {
+  display: flex;
+  justify-content: center;
+  margin: 16px 0;
+}
+
+.miner-nft img {
+  max-width: 200px;
+  max-height: 200px;
+  border-radius: 8px;
+  border: 1px solid #20242b;
+}
+
+.nft-container {
+  position: relative;
+  display: inline-block;
+}
+
+.nft-overlay-id {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffffff;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 2px 8px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+}
+
+.nft-upload-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid #20242b;
+}
+
+.nft-upload-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  margin-top: 8px;
+  border-radius: 6px;
+  border: 1px dashed #3a3f4a;
+  background: #14171c;
+  color: #aab3bf;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.nft-upload-label:hover {
+  border-color: #5a6070;
+  color: #eef3f8;
+}
+
+.nft-upload-label.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.nft-upload-label input[type="file"] {
+  display: none;
+}
+
 @media (max-width: 1040px) {
   .app-shell {
     grid-template-columns: 76px minmax(0, 1fr);

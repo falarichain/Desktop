@@ -345,6 +345,37 @@ function signAdjustCapacity(privateKey: string, params: {
   return signingKey.sign(digest).serialized;
 }
 
+function signUploadNFTTemplate(privateKey: string, params: {
+  chainId: string;
+  minerAddress: string;
+  contentType: string;
+  content: string;
+  nonce: number;
+}) {
+  const contentHash = ethers.sha256(ethers.toUtf8Bytes(params.content));
+  const payload = {
+    action: 'upload_nft_template',
+    chain_id: params.chainId,
+    miner_address: params.minerAddress,
+    content_type: params.contentType,
+    content_hash: contentHash,
+    nonce: params.nonce,
+  };
+  const digest = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(payload)));
+  const signingKey = new ethers.SigningKey(privateKey);
+  return signingKey.sign(digest).serialized;
+}
+
+function renderMinerNFT(template: string, contentType: string, minerId: number, address: string): string {
+  if (contentType === 'image/svg+xml') {
+    const svg = template
+      .replace(/\{\{MINER_ID\}\}/g, `#${String(minerId).padStart(4, '0')}`)
+      .replace(/\{\{MINER_ADDR\}\}/g, address ? `${address.slice(0, 6)}...${address.slice(-4)}` : '');
+    return `data:image/svg+xml;base64,${btoa(svg)}`;
+  }
+  return `data:${contentType};base64,${template}`;
+}
+
 function toWirePayload(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(toWirePayload);
   if (!value || typeof value !== 'object') return value;
@@ -630,6 +661,64 @@ export default function App() {
       }
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '调整容量失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function uploadNFTTemplate(file: File) {
+    if (!selectedWallet?.privateKey) {
+      setNotice('请先选择矿工钱包。');
+      return;
+    }
+    if (minerStats?.miner_id !== 1) {
+      setNotice('只有矿工 #1 可以上传 NFT 模板。');
+      return;
+    }
+    setBusy('upload-nft');
+    try {
+      const content = await new Promise<string>((resolve, reject) => {
+        if (file.type === 'image/svg+xml') {
+          // SVG is text: read as text, then base64-encode
+          const reader = new FileReader();
+          reader.onload = () => resolve(btoa(reader.result as string));
+          reader.onerror = reject;
+          reader.readAsText(file);
+        } else {
+          // PNG/binary: read as data URL, strip header
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result as string;
+            resolve(dataUrl.split(',')[1] || '');
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        }
+      });
+
+      const [account, status] = await Promise.all([api.getAccount(selectedWallet.address), api.getStatus()]);
+      const chainId = status.chainId || status.chain_id || 'falari-dev';
+      const nonce = account.nonce;
+      const signature = signUploadNFTTemplate(selectedWallet.privateKey, {
+        chainId,
+        minerAddress: selectedWallet.address,
+        contentType: file.type,
+        content,
+        nonce,
+      });
+      await postWire(state.chainUrl, '/nft-template', {
+        minerAddress: selectedWallet.address,
+        contentType: file.type,
+        content,
+        chainId,
+        nonce,
+        signature,
+      });
+      const updatedStatus = await api.getStatus();
+      setChainStatus(updatedStatus);
+      setNotice('NFT 模板上传成功，所有矿工的 NFT 图片已更新。');
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '上传 NFT 模板失败');
     } finally {
       setBusy('');
     }
@@ -1054,6 +1143,7 @@ export default function App() {
             onRefreshDisk={refreshDiskInfo}
             onClaimRewards={claimMiningRewards}
             onAdjustCapacity={adjustCapacity}
+            onUploadNFT={uploadNFTTemplate}
           />
         )}
 
@@ -1896,6 +1986,7 @@ function MiningView(props: {
   onRefreshDisk: () => void;
   onClaimRewards: () => void;
   onAdjustCapacity: (newCapacityBytes: number) => void;
+  onUploadNFT: (file: File) => void;
 }) {
   const canControl = Boolean(window.falariDesktop);
   const estimatedStorage = props.minerStats?.estimated_storage_rewards ?? 0;
@@ -1960,6 +2051,24 @@ function MiningView(props: {
             <p>开启后，本机客户端会注册为存储矿工，并强制提供 shard 上传和下载访问服务。</p>
           </div>
         </div>
+        {props.chainStatus?.miner_nft_template && props.minerStats?.miner_id ? (
+          <div className="miner-nft">
+            {props.chainStatus.miner_nft_content_type === 'image/svg+xml' ? (
+              <img
+                src={renderMinerNFT(props.chainStatus.miner_nft_template, props.chainStatus.miner_nft_content_type, props.minerStats.miner_id, props.minerStats.miner_address || '')}
+                alt={`Miner #${props.minerStats.miner_id}`}
+              />
+            ) : (
+              <div className="nft-container">
+                <img
+                  src={renderMinerNFT(props.chainStatus.miner_nft_template, props.chainStatus.miner_nft_content_type, props.minerStats.miner_id, '')}
+                  alt={`Miner #${props.minerStats.miner_id}`}
+                />
+                <span className="nft-overlay-id">#{String(props.minerStats.miner_id).padStart(4, '0')}</span>
+              </div>
+            )}
+          </div>
+        ) : null}
         <div className="detail-grid">
           <Detail label="矿工地址" value={props.selectedWallet ? shortAddress(props.selectedWallet.address) : '未选择钱包'} />
           <Detail label="挖矿编号" value={props.minerStats?.miner_id ? `#${String(props.minerStats.miner_id).padStart(4, '0')}` : '-'} />
@@ -1979,6 +2088,28 @@ function MiningView(props: {
             停止
           </button>
         </div>
+        {props.minerStats?.miner_id === 1 && (
+          <div className="nft-upload-section">
+            <div className="section-title">NFT 模板管理</div>
+            <p className="muted small">作为矿工 #1，你可以上传自定义的 NFT 模板（SVG 或 PNG，最大 512KB）。所有矿工的 NFT 图片将使用此模板。</p>
+            <label className={`nft-upload-label ${props.busy === 'upload-nft' ? 'disabled' : ''}`}>
+              <input
+                type="file"
+                accept=".svg,.png"
+                disabled={props.busy === 'upload-nft'}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) {
+                    props.onUploadNFT(file);
+                    e.target.value = '';
+                  }
+                }}
+              />
+              {props.busy === 'upload-nft' ? <Loader2 className="spin" size={17} /> : <UploadCloud size={17} />}
+              {props.busy === 'upload-nft' ? '上传中...' : '选择并上传模板'}
+            </label>
+          </div>
+        )}
       </section>
 
       <section className="surface">

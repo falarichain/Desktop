@@ -73,12 +73,20 @@ ipcMain.handle('mining:start', (_event, config = {}) => {
   if (config.p2pPeers) finalArgs.push('-p2p-peers', config.p2pPeers);
   miningLogs = [];
   appendMiningLog(`starting mining node: ${command} ${finalArgs.join(' ')}`);
+  // Build a minimal environment for the mining subprocess:
+  // only pass PATH/HOME (required for Go toolchain) and the miner key.
+  // Avoids leaking the parent process's full environment (secrets, tokens, etc.).
+  const childEnv = {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    GOPATH: process.env.GOPATH,
+    GOROOT: process.env.GOROOT,
+    MINER_PRIVATE_KEY: minerPrivateKey,
+  };
   miningProcess = spawn(command, finalArgs, {
     cwd,
-    env: {
-      ...process.env,
-      MINER_PRIVATE_KEY: minerPrivateKey,
-    },
+    env: childEnv,
   });
   miningProcess.stdout.on('data', (chunk) => appendMiningLog(chunk));
   miningProcess.stderr.on('data', (chunk) => appendMiningLog(chunk));
